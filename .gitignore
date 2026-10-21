@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+backend/.serverless/
+local/.s3/
+.DS_Store
+.pytest_cache/

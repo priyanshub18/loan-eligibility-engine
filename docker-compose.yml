@@ -1,0 +1,102 @@
+# Self-hosted n8n + a local Postgres that stands in for RDS during development.
+#
+#   docker compose up -d                       # local mode (app-db + n8n)
+#   docker compose --profile tunnel up -d      # + public HTTPS URL so AWS Lambda can reach n8n
+#
+# All configuration comes from .env (copy .env.example).
+name: loan-engine
+
+x-n8n-image: &n8n-image n8nio/n8n:1.123.5
+
+x-n8n-env: &n8n-env
+  # Credentials are created by n8n-init from these values (see n8n/init/).
+  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+  N8N_DB_HOST: ${N8N_DB_HOST:-app-db}
+  N8N_DB_PORT: ${N8N_DB_PORT:-5432}
+  N8N_DB_NAME: ${N8N_DB_NAME:-loanengine}
+  N8N_DB_USER: ${N8N_DB_USER:-loanadmin}
+  N8N_DB_PASSWORD: ${N8N_DB_PASSWORD:-${APP_DB_PASSWORD}}
+  N8N_DB_SSL: ${N8N_DB_SSL:-disable}
+  N8N_WEBHOOK_TOKEN: ${N8N_WEBHOOK_TOKEN:?set N8N_WEBHOOK_TOKEN in .env}
+  N8N_API_KEY: ${N8N_API_KEY:-}
+  AWS_REGION: ${AWS_REGION:-ap-south-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+  GMAIL_SMTP_USER: ${GMAIL_SMTP_USER:-}
+  GMAIL_SMTP_APP_PASSWORD: ${GMAIL_SMTP_APP_PASSWORD:-}
+
+services:
+  app-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${APP_DB_USER:-loanadmin}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+      POSTGRES_DB: ${APP_DB_NAME:-loanengine}
+    ports:
+      - "${APP_DB_PORT:-5433}:5432"
+    volumes:
+      - app-db-data:/var/lib/postgresql/data
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      retries: 10
+
+  # One-shot: import credentials + workflows and activate them, then exit.
+  n8n-init:
+    image: *n8n-image
+    restart: "no"
+    entrypoint: ["/bin/sh", "/init/import.sh"]
+    environment: *n8n-env
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - ./n8n/init:/init:ro
+      - ./n8n/workflows:/workflows:ro
+
+  n8n:
+    image: *n8n-image
+    restart: unless-stopped
+    depends_on:
+      n8n-init:
+        condition: service_completed_successfully
+    ports:
+      - "5678:5678"
+    environment:
+      <<: *n8n-env
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+      # Public base URL for webhooks (set to your tunnel / domain when exposing n8n to AWS)
+      WEBHOOK_URL: ${N8N_PUBLIC_URL:-http://localhost:5678/}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      N8N_RUNNERS_ENABLED: "true"
+      # Workflows read their tunables via $env (LLM endpoint, caps, test inboxes)
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "true"   # per-node progress for the dashboard while a run is in flight
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: 168
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gemini-3.5-flash-lite}
+      LLM_MAX_CALLS_PER_RUN: ${LLM_MAX_CALLS_PER_RUN:-20}
+      MAX_MATCHES_PER_USER: ${MAX_MATCHES_PER_USER:-5}
+      EMAIL_USE_GMAIL: ${EMAIL_USE_GMAIL:-false}    # false = AWS SES (default), true = Gmail SMTP fallback
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Loan Eligibility Engine}
+      SES_FROM_EMAIL: ${SES_FROM_EMAIL:-}
+      TEST_INBOX_ALIASES: ${TEST_INBOX_ALIASES:-}
+      NOTIFY_MAX_EMAILS: ${NOTIFY_MAX_EMAILS:-3}
+    volumes:
+      - n8n-data:/home/node/.n8n
+
+  # Optional: free Cloudflare quick tunnel -> prints https://<random>.trycloudflare.com
+  # in `docker compose logs tunnel`. Use it for N8N_MATCH_WEBHOOK_URL when deploying to AWS.
+  tunnel:
+    image: cloudflare/cloudflared:2024.12.2
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate --url http://n8n:5678
+    depends_on: [n8n]
+
+volumes:
+  app-db-data:
+  n8n-data:
