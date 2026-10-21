@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loan Engine Console</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- config.js sets window.API_BASE (API Gateway URL on AWS, '' for the local dev server) -->
+<script src="config.js"></script>
+<style>
+  :root {
+    --ink:#000; --paper:#fff; --red:#d7261e; --green:#0e7c3a;
+    --t2:rgba(0,0,0,.62); --t3:rgba(0,0,0,.42); --rule:rgba(0,0,0,.13); --wash:rgba(0,0,0,.035); --wash2:rgba(0,0,0,.07);
+    --sans:'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif; --mono:'IBM Plex Mono', ui-monospace, Menlo, monospace;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font:14px/1.45 var(--sans); color:var(--ink); background:var(--paper); -webkit-font-smoothing:antialiased; }
+  button { font:inherit; }
+  a { color:inherit; }
+  .mono { font-family:var(--mono); }
+  .muted { color:var(--t2); } .faint { color:var(--t3); } .red { color:var(--red); } .green { color:var(--green); }
+
+  /* top bar */
+  header { position:sticky; top:0; z-index:20; background:#000; color:#fff; }
+  .bar { display:flex; align-items:center; gap:22px; padding:0 28px; height:56px; }
+  .brand { font-weight:600; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .brand small { font:400 12px var(--mono); color:rgba(255,255,255,.5); margin-left:10px; }
+  .pills { display:flex; gap:10px; margin-left:auto; flex-wrap:wrap; justify-content:flex-end; }
+  .pill { font:500 12px var(--mono); border:1px solid rgba(255,255,255,.3); padding:4px 10px; display:flex; gap:7px; align-items:center; white-space:nowrap; }
+  .pill i { width:8px; height:8px; border-radius:50%; background:rgba(255,255,255,.4); }
+  .pill.ok i { background:#3fcf7d; } .pill.bad i { background:#ff5a4e; } .pill.run { border-color:#fff; cursor:pointer; } .pill.run i { background:#fff; animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.25; } }
+  nav { display:flex; gap:2px; padding:0 28px; background:#000; border-top:1px solid rgba(255,255,255,.12); overflow-x:auto; }
+  nav button { all:unset; cursor:pointer; color:rgba(255,255,255,.6); font:500 13px var(--sans); padding:11px 14px; border-bottom:2px solid transparent; white-space:nowrap; }
+  nav button.on { color:#fff; border-color:var(--red); }
+
+  main { padding:24px 28px 60px; max-width:1680px; margin:0 auto; }
+  .view { display:none; } .view.on { display:block; }
+  h2 { font-size:22px; font-weight:500; letter-spacing:-.01em; }
+  h3 { font-size:15px; font-weight:600; }
+  .label { font:500 11px var(--mono); letter-spacing:.09em; text-transform:uppercase; color:var(--t3); }
+  .card { border:1px solid var(--rule); padding:18px 20px; }
+  .card.k { border-color:#000; }
+  .grid { display:grid; gap:20px; grid-template-columns:minmax(0, 1fr); }
+  .card, .grid > * { min-width:0; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  .sp { flex:1; }
+  .btn { border:1.5px solid #000; background:#000; color:#fff; padding:8px 16px; cursor:pointer; font-weight:500; }
+  .btn.o { background:#fff; color:#000; } .btn:disabled { opacity:.35; cursor:not-allowed; }
+  .btn.sm { padding:4px 10px; font-size:12.5px; }
+  .chip { display:inline-flex; align-items:center; gap:6px; font:500 11.5px var(--mono); padding:2px 8px; border:1px solid currentColor; white-space:nowrap; }
+  .chip.ok { color:var(--green); } .chip.bad { color:var(--red); } .chip.run { color:#000; background:var(--wash2); } .chip.wait { color:var(--t3); }
+  .chip.run::before { content:''; width:6px; height:6px; border-radius:50%; background:#000; animation:pulse 1s infinite; }
+  input[type=search] { border:1.5px solid #000; padding:7px 10px; font:inherit; min-width:260px; border-radius:0; }
+
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; font:500 10.5px var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--t3); padding:0 10px 8px 0; border-bottom:1.5px solid #000; white-space:nowrap; }
+  td { padding:8px 10px 8px 0; border-bottom:1px solid var(--rule); vertical-align:top; }
+  td.m, .m { font:500 12.5px var(--mono); }
+  tr.click { cursor:pointer; } tr.click:hover td { background:var(--wash); }
+  .scroll { overflow:auto; }
+
+  /* pipeline layout */
+  .pipe { display:grid; grid-template-columns:330px minmax(0, 1fr); gap:24px; align-items:start; }
+  .drop { display:block; border:1.5px dashed #000; padding:22px 16px; text-align:center; cursor:pointer; }
+  .drop.over { background:var(--wash2); }
+  progress { width:100%; height:6px; appearance:none; border:0; background:var(--wash2); }
+  progress::-webkit-progress-bar { background:var(--wash2); } progress::-webkit-progress-value { background:#000; }
+  .blist { display:flex; flex-direction:column; }
+  .bitem { padding:10px 0; border-bottom:1px solid var(--rule); cursor:pointer; }
+  .bitem.on { background:var(--wash2); margin:0 -10px; padding:10px; }
+  .bitem .t { display:flex; gap:8px; align-items:center; }
+
+  .steps { display:grid; grid-template-columns:repeat(7, minmax(0, 1fr)); border:1.5px solid #000; }
+  .step { padding:14px 14px 12px; border-right:1px solid var(--rule); position:relative; min-height:128px; }
+  .step:last-child { border-right:0; }
+  .step .n { font:600 11px var(--mono); color:var(--t3); }
+  .step .nm { font-weight:600; margin-top:6px; line-height:1.25; }
+  .step .svc { font:400 11px var(--mono); color:var(--t2); margin-top:3px; }
+  .step .ts { font:500 12px var(--mono); margin-top:10px; }
+  .step .dt { font-size:12.5px; color:var(--t2); margin-top:2px; }
+  .step::after { content:''; position:absolute; left:0; right:0; top:0; height:4px; background:transparent; }
+  .step.done::after { background:var(--green); } .step.cur::after { background:#000; animation:pulse 1s infinite; } .step.fail::after { background:var(--red); }
+  .step.done .n { color:var(--green); } .step.fail .n { color:var(--red); } .step.cur .n { color:#000; }
+  .step.cur { background:var(--wash); }
+
+  .runs { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1fr); gap:20px; }
+  .nodes { display:flex; flex-direction:column; }
+  .node { display:grid; grid-template-columns:20px minmax(0, 1fr) 70px 64px; gap:8px; align-items:center; padding:6px 0; border-bottom:1px solid var(--rule); cursor:pointer; font-size:13px; }
+  .node:hover { background:var(--wash); }
+  .node .d { width:12px; height:12px; border:1.5px solid var(--t3); border-radius:50%; }
+  .node.success .d { background:var(--green); border-color:var(--green); } .node.error .d { background:var(--red); border-color:var(--red); }
+  .node.running .d { background:#000; border-color:#000; animation:pulse 1s infinite; } .node.skip { color:var(--t3); }
+  .node .ms, .node .it { font:500 11.5px var(--mono); text-align:right; color:var(--t2); }
+  .node.sel { background:var(--wash2); }
+  pre.json { background:#000; color:#fff; font:12px/1.55 var(--mono); padding:12px 14px; overflow:auto; max-height:320px; white-space:pre; }
+
+  .funnel .fr { display:grid; grid-template-columns:200px minmax(0, 1fr) 80px; gap:12px; align-items:center; padding:5px 0; font-size:13px; }
+  .funnel .bb { height:16px; background:var(--wash); } .funnel .bb div { height:100%; background:#000; transition:width .6s; }
+  .funnel .fr.llm .bb div { background:var(--red); } .funnel .v { font:600 13px var(--mono); text-align:right; }
+
+  .tabs { display:flex; gap:0; border-bottom:1.5px solid #000; margin-bottom:12px; }
+  .tabs button { all:unset; cursor:pointer; padding:8px 14px; font-weight:500; color:var(--t2); }
+  .tabs button.on { background:#000; color:#fff; }
+
+  .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:16px; }
+  .stat { border-top:2px solid #000; padding-top:8px; }
+  .stat .v { font-size:26px; font-weight:500; letter-spacing:-.01em; } .stat .l { font-size:12.5px; color:var(--t2); }
+
+  .wf { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:20px; }
+  .tag { font:600 10.5px var(--mono); padding:1px 6px; border:1px solid currentColor; }
+
+  /* drawer */
+  #drawer { position:fixed; top:0; right:0; bottom:0; width:min(620px, 100vw); background:#fff; border-left:2px solid #000; z-index:40; transform:translateX(100%); transition:transform .25s; overflow:auto; padding:22px 24px 40px; }
+  #drawer.on { transform:none; }
+  #shade { position:fixed; inset:0; background:rgba(0,0,0,.25); z-index:30; display:none; } #shade.on { display:block; }
+  .kv { display:grid; grid-template-columns:150px minmax(0, 1fr); gap:6px 14px; font-size:13.5px; }
+  .kv div:nth-child(odd) { color:var(--t2); }
+  .err { border:1.5px solid var(--red); color:var(--red); padding:10px 14px; margin-bottom:16px; display:none; }
+
+  @media (max-width: 1100px) {
+    .pipe, .runs, .wf { grid-template-columns:minmax(0, 1fr); }
+    .steps { grid-template-columns:repeat(2, minmax(0, 1fr)); } .step { border-bottom:1px solid var(--rule); }
+  }
+  @media (max-width: 640px) { main { padding:16px; } .bar, nav { padding:0 16px; } .pills .pill:not(.run) { display:none; } .brand small { display:none; }
+    .funnel .fr { grid-template-columns:120px minmax(0, 1fr) 60px; } .kv { grid-template-columns:110px minmax(0, 1fr); } input[type=search] { min-width:0; width:100%; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="brand">Loan Eligibility Engine<small id="envTag">connecting…</small></div>
+    <div class="pills">
+      <span class="pill" id="pRun" style="display:none"></span>
+      <span class="pill" id="pApi"><i></i>API</span>
+      <span class="pill" id="pDb"><i></i>Database</span>
+      <span class="pill" id="pN8n"><i></i>n8n</span>
+    </div>
+  </div>
+  <nav id="nav">
+    <button data-v="pipeline" class="on">Pipeline</button>
+    <button data-v="workflows">Workflows (n8n)</button>
+    <button data-v="products">Workflow A · Products</button>
+    <button data-v="emails">Workflow C · Emails</button>
+    <button data-v="database">Database</button>
+  </nav>
+</header>
+
+<main>
+  <div class="err" id="err"></div>
+
+  <!-- ============================================================ PIPELINE -->
+  <section class="view on" id="v-pipeline">
+    <div class="pipe">
+      <div class="grid">
+        <div class="card k">
+          <h3>Upload users CSV</h3>
+          <p class="muted" style="font-size:13px; margin:4px 0 12px">The browser asks the API for a presigned form, then posts the file straight to S3. Everything after that is event-driven.</p>
+          <label class="drop" id="drop"><input type="file" id="file" accept=".csv,text/csv" hidden>
+            <div id="dropText"><b>Drop a .csv here</b><br><span class="muted">or click to choose</span></div></label>
+          <div class="row" style="margin-top:12px"><button class="btn" id="upload" disabled>Upload and run</button><span class="sp"></span><span class="faint m" id="upInfo"></span></div>
+          <progress id="progress" value="0" max="100" hidden style="margin-top:10px"></progress>
+        </div>
+        <div class="card">
+          <div class="row"><h3>Uploads</h3><span class="sp"></span><button class="btn o sm" id="refreshB">refresh</button></div>
+          <div class="blist" id="blist" style="margin-top:8px"><span class="faint">loading…</span></div>
+        </div>
+      </div>
+
+      <div class="grid" id="batchPane">
+        <div class="card"><span class="faint">Select an upload, or upload a CSV to start the pipeline.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ WORKFLOWS -->
+  <section class="view" id="v-workflows">
+    <div class="row" style="margin-bottom:16px"><h2>n8n workflows</h2><span class="sp"></span><span class="muted" id="wfNote"></span></div>
+    <div class="wf" id="wfCards"></div>
+    <div class="card k" id="execPane" style="margin-top:20px"><span class="faint">Click a run to see what each node did.</span></div>
+  </section>
+
+  <!-- ============================================================ PRODUCTS -->
+  <section class="view" id="v-products">
+    <div class="row" style="margin-bottom:16px"><h2>Workflow A · loan products crawled from bank websites</h2><span class="sp"></span>
+      <button class="btn" id="runA">Run Workflow A now</button></div>
+    <div class="stats" id="pStats" style="margin-bottom:20px"></div>
+    <div class="card" style="margin-bottom:20px"><div class="label" style="margin-bottom:8px">Latest Workflow A run</div><div id="aRun" class="faint">loading…</div></div>
+    <div class="card scroll"><table id="pTable"></table></div>
+    <div class="card scroll" style="margin-top:20px"><div class="row"><h3>crawl_cache</h3><span class="muted">page fingerprints; an unchanged hash means the LLM is skipped</span></div><table id="cTable" style="margin-top:10px"></table></div>
+  </section>
+
+  <!-- ============================================================ EMAILS -->
+  <section class="view" id="v-emails">
+    <div class="row" style="margin-bottom:16px"><h2>Workflow C · emails sent through Amazon SES</h2><span class="sp"></span><span class="muted">Recipients are always rewritten to test aliases</span></div>
+    <div class="card scroll"><table id="eTable"></table></div>
+  </section>
+
+  <!-- ============================================================ DATABASE -->
+  <section class="view" id="v-database">
+    <h2 style="margin-bottom:16px">Database connections</h2>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(380px, 1fr))">
+      <div class="card k" id="dbConn"></div>
+      <div class="card" id="dbClients"></div>
+    </div>
+    <div class="card" style="margin-top:20px"><h3>Tables</h3><div id="dbTables" style="margin-top:10px"></div></div>
+  </section>
+</main>
+
+<div id="shade"></div>
+<aside id="drawer"></aside>
+
+<script>
+const API = (window.API_BASE || '').replace(/\/$/, '');
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = n => n == null ? '—' : Number(n).toLocaleString('en-US');
+const inr = n => n == null ? '—' : '₹' + Number(n).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+const time = t => t ? new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+const when = t => t ? new Date(t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+const ago = t => { const s = (Date.now() - new Date(t)) / 1000; return s < 60 ? `${Math.round(s)} s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+const dur = (a, b) => a && b ? ((new Date(b) - new Date(a)) / 1000).toFixed(1) + ' s' : '';
+const TERMINAL = ['notified', 'failed', 'notify_webhook_failed', 'notify_failed'];
+
+async function api(path, opts) {
+  const res = await fetch(`${API}${path}`, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+function showErr(msg) { $('err').textContent = msg; $('err').style.display = msg ? 'block' : 'none'; }
+function chip(status) {
+  const cls = status === 'notified' || status === 'success' ? 'ok' : /fail|error|crashed/.test(status) ? 'bad'
+    : ['awaiting_upload'].includes(status) ? 'wait' : 'run';
+  return `<span class="chip ${cls}">${esc(status)}</span>`;
+}
+
+// ---------------------------------------------------------------- state
+const S = { overview: null, workflows: null, batchId: null, batch: null, runSel: 'B', exec: {}, nodeSel: null, mq: '', moff: 0, tab: 'matches' };
+let batchTimer = null;
+
+// ---------------------------------------------------------------- navigation
+$('nav').onclick = e => {
+  const v = e.target.dataset.v; if (!v) return;
+  document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('on', b.dataset.v === v));
+  document.querySelectorAll('.view').forEach(s => s.classList.toggle('on', s.id === 'v-' + v));
+  ({ workflows: loadWorkflows, products: loadProducts, emails: loadEmails, database: renderDb })[v]?.();
+};
+const go = v => document.querySelector(`#nav button[data-v="${v}"]`).click();
+
+// ---------------------------------------------------------------- overview / health
+async function loadOverview() {
+  try {
+    const o = S.overview = await api('/api/overview');
+    $('pApi').className = 'pill ok';
+    $('pDb').className = 'pill ok'; $('pDb').innerHTML = `<i></i>DB ${o.db.latency_ms} ms${o.db.ssl ? ' · TLS' : ''}`;
+    const wfs = o.n8n.workflows || [];
+    $('pN8n').className = 'pill ' + (o.n8n.ok ? 'ok' : 'bad');
+    $('pN8n').innerHTML = `<i></i>n8n ${o.n8n.ok ? `${wfs.filter(w => w.active).length}/${wfs.length} active` : 'unreachable'}`;
+    $('envTag').textContent = o.environment.mode === 'aws' ? `AWS · ${o.environment.db_host.split('.')[0]}` : `local · ${o.environment.db_host}`;
+    const run = (o.n8n.running || [])[0];
+    if (run) {
+      const wf = wfs.find(w => w.id === run.workflowId);
+      $('pRun').style.display = ''; $('pRun').className = 'pill run';
+      $('pRun').innerHTML = `<i></i>running: Workflow ${esc(wf?.key || '?')} · ${ago(run.startedAt)}`;
+      $('pRun').onclick = () => { go('workflows'); openExec(run.id); };
+    } else $('pRun').style.display = 'none';
+    if (document.querySelector('#v-database.on')) renderDb();
+  } catch (e) {
+    $('pApi').className = 'pill bad'; $('pDb').className = 'pill bad'; $('envTag').textContent = 'API unreachable';
+    showErr(`Cannot reach the API at ${API || location.origin}: ${e.message}`);
+  }
+}
+async function workflows() {
+  if (!S.workflows) { try { S.workflows = await api('/api/workflows'); } catch { S.workflows = { workflows: [], ui_url: '' }; } }
+  return S.workflows;
+}
+const wfByKey = k => (S.workflows?.workflows || []).find(w => w.key === k);
+const n8nLink = (wfId, execId) => `${S.workflows?.ui_url || 'http://localhost:5678'}/workflow/${wfId}${execId ? `/executions/${execId}` : ''}`;
+
+// ---------------------------------------------------------------- uploads list + upload
+async function loadBatches() {
+  try {
+    const { batches } = await api('/api/batches?limit=25');
+    $('blist').innerHTML = batches.length ? batches.map(b => `
+      <div class="bitem ${b.batch_id === S.batchId ? 'on' : ''}" data-id="${b.batch_id}">
+        <div class="t"><b>${esc(b.file_name)}</b><span class="sp"></span>${chip(b.status)}</div>
+        <div class="faint m" style="margin-top:3px">${b.batch_id.slice(0, 8)} · ${when(b.created_at)}</div>
+        <div class="muted" style="font-size:12.5px">${num(b.rows_inserted)} rows · ${num(b.final_matches)} matches · ${num(b.emails_sent)} emails</div>
+      </div>`).join('') : '<span class="faint">No uploads yet.</span>';
+    if (!S.batchId && batches[0]) selectBatch(batches[0].batch_id);
+  } catch (e) { $('blist').innerHTML = `<span class="red">${esc(e.message)}</span>`; }
+}
+$('blist').onclick = e => { const it = e.target.closest('.bitem'); if (it) selectBatch(it.dataset.id); };
+$('refreshB').onclick = loadBatches;
+
+let file = null;
+const pick = f => { file = f; $('dropText').innerHTML = f ? `<b>${esc(f.name)}</b><br><span class="muted">${(f.size / 1024).toFixed(0)} KB</span>` : ''; $('upload').disabled = !f; };
+$('file').onchange = e => pick(e.target.files[0]);
+['dragover', 'dragenter'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.remove('over'); }));
+$('drop').addEventListener('drop', e => e.dataTransfer.files[0] && pick(e.dataTransfer.files[0]));
+
+function postForm(url, form) {   // XHR so we can show upload progress
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest(); xhr.open('POST', url);
+    xhr.upload.onprogress = e => e.lengthComputable && ($('progress').value = 100 * e.loaded / e.total);
+    xhr.onload = () => xhr.status < 300 ? resolve(xhr.status) : reject(new Error(`S3 rejected the upload (HTTP ${xhr.status})`));
+    xhr.onerror = () => reject(new Error('Network error during upload')); xhr.send(form);
+  });
+}
+$('upload').onclick = async () => {
+  showErr(''); $('upload').disabled = true; $('progress').hidden = false; $('progress').value = 0;
+  try {
+    const data = await api('/uploads', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file_name: file.name, size: file.size }) });
+    S.uploading = { id: data.batch_id, url: data.upload.url };
+    selectBatch(data.batch_id);
+    const form = new FormData();
+    Object.entries(data.upload.fields).forEach(([k, v]) => form.append(k, v));
+    form.append('file', file);
+    const code = await postForm(data.upload.url, form);
+    S.uploading = { ...S.uploading, done: true, code };
+    $('upInfo').textContent = `S3 HTTP ${code}`;
+    loadBatches();
+  } catch (e) { showErr(e.message); S.uploading = null; }
+  finally { $('upload').disabled = !file; }
+};
+
+// ---------------------------------------------------------------- selected batch
+function selectBatch(id) {
+  if (S.batchId !== id) { S.batchId = id; S.listRefreshed = false; S.exec = {}; S.nodeSel = null; S.moff = 0; S.mq = ''; S.runSel = 'B'; }
+  document.querySelectorAll('.bitem').forEach(b => b.classList.toggle('on', b.dataset.id === id));
+  clearTimeout(batchTimer); pollBatch();
+}
+async function pollBatch() {
+  const id = S.batchId;
+  try {
+    const b = await api(`/api/batches/${id}`);
+    if (id !== S.batchId) return;
+    S.batch = b;
+    await Promise.all(['B', 'C'].map(async k => {
+      const run = b.runs?.[k];
+      if (run && (!S.exec[run.id] || S.exec[run.id].status === 'running' || S.exec[run.id].status === 'new'))
+        S.exec[run.id] = await api(`/api/executions/${run.id}`).catch(() => S.exec[run.id]);
+    }));
+    renderBatch();
+    if (!TERMINAL.includes(b.status) || Object.values(b.runs || {}).some(r => !r.finished)) batchTimer = setTimeout(pollBatch, 2000);
+    else if (!S.listRefreshed) { S.listRefreshed = true; loadBatches(); }
+  } catch (e) { showErr(e.message); batchTimer = setTimeout(pollBatch, 5000); }
+}
+
+const STEPS = [
+  { nm: 'Request upload form', svc: 'API Gateway → λ uploadUrl', at: 'awaiting_upload' },
+  { nm: 'File to S3', svc: 'browser → S3 (presigned)', at: null },
+  { nm: 'Queue + ingest', svc: 'S3 event → SQS → λ ingestCsv', at: 'ingesting' },
+  { nm: 'Rows in RDS', svc: 'COPY + upsert · PostgreSQL', at: 'ingested' },
+  { nm: 'Workflow B · matching', svc: 'n8n · SQL → rules → LLM', at: 'matching' },
+  { nm: 'Workflow C · email', svc: 'n8n · AWS SES node', at: 'matched' },
+  { nm: 'Done', svc: 'users notified', at: 'notified' },
+];
+const ORDER = ['awaiting_upload', 'ingesting', 'ingested', 'matching', 'matched', 'notified'];
+function stepStates(b) {
+  const idx = { awaiting_upload: 1, ingesting: 2, ingested: 4, matching: 4, matched: 5, notified: 7 }[b.status];
+  const fail = { failed: 2, notify_webhook_failed: 4, notify_failed: 5 }[b.status];
+  return STEPS.map((_, i) => {
+    if (fail !== undefined) return i < fail ? 'done' : i === fail ? 'fail' : 'wait';
+    if (b.status === 'awaiting_upload') return i === 0 ? 'done' : i === 1 ? (S.uploading?.id === b.batch_id && !S.uploading.done ? 'cur' : 'wait') : 'wait';
+    return i < idx ? 'done' : i === idx ? 'cur' : 'wait';
+  });
+}
+function renderBatch() {
+  const b = S.batch, ms = b.match_stats || {};
+  const hist = Object.fromEntries((b.status_history || []).map(h => [h.status, h.at]));
+  const t0 = b.created_at;
+  const st = stepStates(b);
+  const detail = [
+    `batch ${b.batch_id.slice(0, 8)}`,
+    S.uploading?.id === b.batch_id && S.uploading.done ? `HTTP ${S.uploading.code}` : (hist.ingesting ? 'uploaded' : ''),
+    b.rows_total != null ? `${num(b.rows_total)} rows read` : '',
+    b.rows_inserted != null ? `${num(b.rows_inserted)} in · ${num(b.rows_rejected)} rejected` : '',
+    ms.stage1_sql_pairs ? `${num(ms.final_matches)} matches · ${ms.stage3_llm_calls} LLM calls` : '',
+    ms.emails_sent != null ? `${ms.emails_sent} emails sent` : '',
+    b.status === 'notified' ? `${dur(t0, b.updated_at)} end to end` : '',
+  ];
+  const ts = [t0, hist.ingesting, hist.ingesting, hist.ingested, hist.matching, hist.matched, hist.notified];
+  const runs = b.runs || {};
+  const running = ['B', 'C'].find(k => runs[k] && !runs[k].finished);
+
+  $('batchPane').innerHTML = `
+    <div class="card k">
+      <div class="row"><h2>${esc(b.file_name)}</h2>${chip(b.status)}<span class="sp"></span>
+        <span class="m faint">${esc(b.batch_id)}</span></div>
+      <div class="muted" style="margin-top:4px">uploaded ${when(b.created_at)} · last change ${when(b.updated_at)}${running ? ` · <b style="color:#000">Workflow ${running} is running now</b>` : ''}</div>
+      ${b.error ? `<div class="red" style="margin-top:8px">${esc(b.error)}</div>` : ''}
+      <div class="steps" style="margin-top:16px">${STEPS.map((s, i) => `
+        <div class="step ${st[i]}">
+          <div class="n">${st[i] === 'done' ? '✓' : st[i] === 'fail' ? '✕' : st[i] === 'cur' ? '●' : '○'} STEP ${i + 1}</div>
+          <div class="nm">${s.nm}</div><div class="svc">${s.svc}</div>
+          <div class="ts">${st[i] === 'done' || st[i] === 'cur' ? (ts[i] ? `${time(ts[i])} <span class="faint">+${dur(t0, ts[i]) || '0.0 s'}</span>` : '') : ''}</div>
+          <div class="dt">${st[i] !== 'wait' ? esc(detail[i]) : ''}</div>
+        </div>`).join('')}</div>
+    </div>
+
+    <div class="runs">
+      <div class="card">
+        <div class="row"><div class="tabs" style="margin:0; border:0">
+          ${['B', 'C'].map(k => `<button data-run="${k}" class="${S.runSel === k ? 'on' : ''}">Workflow ${k} ${runs[k] ? `#${runs[k].id}` : ''}</button>`).join('')}</div>
+          <span class="sp"></span>${runs[S.runSel] ? `<a class="m" target="_blank" href="${n8nLink(runs[S.runSel].workflowId, runs[S.runSel].id)}">open in n8n ↗</a>` : ''}</div>
+        <div id="runBox" style="margin-top:10px">${renderRun(S.runSel)}</div>
+      </div>
+      <div class="card">
+        <div class="row"><h3>Matching funnel</h3><span class="sp"></span><span class="m faint">${ms.duration_ms ? `Workflow B ${(ms.duration_ms / 1000).toFixed(1)} s` : ''}</span></div>
+        ${funnel(ms)}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="tabs">
+        ${[['matches', 'Matches'], ['emails', 'Emails sent'], ['rejected', `Rejected rows (${b.rows_rejected ?? 0})`]].map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join('')}
+      </div>
+      <div id="tabBox"></div>
+    </div>`;
+  $('batchPane').querySelectorAll('[data-run]').forEach(x => x.onclick = () => { S.runSel = x.dataset.run; S.nodeSel = null; renderBatch(); });
+  $('batchPane').querySelectorAll('[data-tab]').forEach(x => x.onclick = () => { S.tab = x.dataset.tab; renderBatch(); });
+  bindRun();
+  renderTab();
+}
+
+function funnel(ms) {
+  if (!ms.naive_pairs) return '<p class="faint" style="margin-top:10px">Appears when Workflow B finishes.</p>';
+  const rows = [['all user × product pairs', ms.naive_pairs], ['Stage 1 · SQL filter', ms.stage1_sql_pairs], ['Stage 2 · top 5 per user', ms.stage2_after_top_k],
+    ['borderline pairs', ms.stage2_borderline], ['Stage 3 · unique questions', ms.stage3_unique_questions, 1], ['LLM calls', ms.stage3_llm_calls, 1],
+    ['answered from cache', ms.stage3_cache_hit_buckets, 1], ['final matches', ms.final_matches], ['users matched', ms.users_matched]];
+  const max = Math.log10(ms.naive_pairs);
+  return `<div class="funnel" style="margin-top:10px">${rows.map(([l, v, llm]) => `<div class="fr ${llm ? 'llm' : ''}"><span>${l}</span>
+    <div class="bb"><div style="width:${v > 0 ? Math.max(1.5, Math.log10(v + 1) / max * 100) : 0}%"></div></div><span class="v">${num(v)}</span></div>`).join('')}</div>`;
+}
+
+// node-by-node view of one n8n execution
+function renderRun(key, ex, wfNodes) {
+  const run = S.batch?.runs?.[key];
+  ex = ex || (run && S.exec[run.id]);
+  wfNodes = wfNodes || wfByKey(key)?.nodes || [];
+  if (!run && !ex) return `<p class="faint">${S.batch?.runs_error ? esc(S.batch.runs_error) : `Workflow ${key} has not run for this batch yet.`}</p>`;
+  if (!ex) return '<p class="faint">loading run…</p>';
+  const ran = Object.fromEntries(ex.nodes.map(n => [n.name, n]));
+  const isRunning = ['running', 'new'].includes(ex.status);
+  let nextMarked = false;
+  const list = (wfNodes.length ? wfNodes.map(n => n.name) : ex.nodes.map(n => n.name)).map(name => {
+    const n = ran[name];
+    let cls = n ? n.status : 'skip';
+    if (!n && isRunning && !nextMarked && !/trigger|webhook|Run manually|Daily/i.test(name)) { cls = 'running'; nextMarked = true; }
+    return `<div class="node ${cls} ${S.nodeSel === name ? 'sel' : ''}" data-node="${esc(name)}"><span class="d"></span>
+      <span>${esc(name)}${n?.error ? ` <span class="red">· ${esc(n.error)}</span>` : ''}${cls === 'running' ? ' <b>· running…</b>' : ''}</span>
+      <span class="it">${n ? n.items.join(' / ') + ' out' : ''}</span><span class="ms">${n?.ms != null ? n.ms + ' ms' : ''}</span></div>`;
+  }).join('');
+  const sel = S.nodeSel && ran[S.nodeSel];
+  return `<div class="row m" style="font-size:12.5px; margin-bottom:6px">${chip(ex.status)}<span>exec #${esc(ex.id)}</span><span class="faint">${time(ex.startedAt)} · ${dur(ex.startedAt, ex.stoppedAt) || 'in progress'}</span></div>
+    <div class="nodes">${list}</div>
+    ${sel ? `<div class="label" style="margin:12px 0 6px">${esc(S.nodeSel)} · first output item</div><pre class="json">${esc(JSON.stringify(sel.preview, null, 2))}</pre>`
+          : '<p class="faint" style="margin-top:8px; font-size:12.5px">Click a node to see its output.</p>'}`;
+}
+function bindRun() {
+  $('runBox')?.querySelectorAll('[data-node]').forEach(x => x.onclick = () => { S.nodeSel = x.dataset.node; $('runBox').innerHTML = renderRun(S.runSel); bindRun(); });
+}
+
+// ---------------------------------------------------------------- batch tabs
+async function renderTab() {
+  const box = $('tabBox'), b = S.batch;
+  if (S.tab === 'rejected') {
+    const rs = b.rejected_sample || [];
+    box.innerHTML = rs.length ? `<table><tr><th>line</th><th>reason</th><th>row</th></tr>${rs.map(r => `<tr><td class="m">${esc(r.line ?? r.row_number ?? '')}</td><td class="red">${esc(r.reason ?? r.error ?? '')}</td><td class="m">${esc(JSON.stringify(r.row ?? r))}</td></tr>`).join('')}</table>`
+      : '<p class="faint">No rows were rejected.</p>';
+    return;
+  }
+  if (S.tab === 'emails') {
+    const { notifications } = await api(`/api/notifications?batch_id=${b.batch_id}`);
+    box.innerHTML = emailTable(notifications) || '<p class="faint">No emails for this batch yet.</p>';
+    bindUserRows(box); return;
+  }
+  box.innerHTML = `<div class="row" style="margin-bottom:10px"><input type="search" id="mq" placeholder="search name, email, lender, source…" value="${esc(S.mq)}">
+    <span class="sp"></span><span class="m faint" id="mInfo"></span><button class="btn o sm" id="mPrev">‹ prev</button><button class="btn o sm" id="mNext">next ›</button></div><div class="scroll" id="mTable"><span class="faint">loading…</span></div>`;
+  let deb; $('mq').oninput = e => { clearTimeout(deb); deb = setTimeout(() => { S.mq = e.target.value; S.moff = 0; loadMatches(); }, 300); };
+  $('mPrev').onclick = () => { S.moff = Math.max(0, S.moff - 50); loadMatches(); };
+  $('mNext').onclick = () => { S.moff += 50; loadMatches(); };
+  loadMatches();
+}
+async function loadMatches() {
+  const r = await api(`/api/batches/${S.batchId}/matches?limit=50&offset=${S.moff}&q=${encodeURIComponent(S.mq)}`);
+  $('mInfo').textContent = r.total ? `${S.moff + 1}–${Math.min(S.moff + 50, r.total)} of ${num(r.total)} · ${Object.entries(r.by_source).map(([k, v]) => `${k} ${num(v)}`).join(' · ')}` : '';
+  $('mPrev').disabled = S.moff === 0; $('mNext').disabled = S.moff + 50 >= r.total;
+  $('mTable').innerHTML = r.rows.length ? `<table><tr><th>user</th><th>income</th><th>score</th><th>emp · age</th><th>product</th><th>match score</th><th>decided by</th><th>reason</th><th>emailed</th></tr>
+    ${r.rows.map(m => `<tr class="click" data-user="${esc(m.user_id)}"><td><b>${esc(m.name)}</b><div class="faint m">${esc(m.email)}</div></td>
+      <td class="m">${inr(m.monthly_income)}</td><td class="m">${m.credit_score}</td><td>${esc(m.employment_status)} · ${m.age}</td>
+      <td>${esc(m.lender)}</td><td class="m">${m.score}</td><td>${srcTag(m.decision_source)}</td><td class="muted">${esc(m.reason)}</td>
+      <td class="m">${m.notified_at ? '<span class="green">✓</span>' : '—'}</td></tr>`).join('')}</table>`
+    : '<p class="faint">No matches for this batch (yet). Matches belong to the most recent batch that uploaded each user.</p>';
+  bindUserRows($('mTable'));
+}
+const srcTag = s => `<span class="tag" style="color:${s === 'rules' ? '#000' : s?.startsWith('llm') ? 'var(--red)' : 'var(--t2)'}">${esc(s)}</span>`;
+function bindUserRows(el) { el.querySelectorAll('[data-user]').forEach(tr => tr.onclick = () => openUser(tr.dataset.user)); }
+function emailTable(rows) {
+  return rows.length ? `<table><tr><th>sent</th><th>user</th><th>original address (never emailed)</th><th>delivered to</th><th>products</th><th>SES MessageId</th></tr>
+    ${rows.map(n => `<tr class="click" data-user="${esc(n.user_id)}"><td class="m">${when(n.sent_at)}</td><td><b>${esc(n.name)}</b></td>
+      <td class="faint" style="text-decoration:line-through">${esc(n.original_email)}</td><td class="m">${esc(n.sent_to)}</td>
+      <td class="m">${esc((n.product_ids || []).join(', '))}</td><td class="m" style="word-break:break-all">${esc(n.ses_message_id)}</td></tr>`).join('')}</table>` : '';
+}
+
+// ---------------------------------------------------------------- user drawer
+async function openUser(id) {
+  $('drawer').innerHTML = '<span class="faint">loading…</span>'; $('drawer').classList.add('on'); $('shade').classList.add('on');
+  try {
+    const { user: u, matches, notifications } = await api(`/api/users/${encodeURIComponent(id)}`);
+    $('drawer').innerHTML = `<div class="row"><h2>${esc(u.name)}</h2><span class="sp"></span><button class="btn o sm" id="dClose">close ✕</button></div>
+      <div class="kv" style="margin-top:14px">
+        <div>user_id</div><div class="m">${esc(u.user_id)}</div><div>email (CSV)</div><div>${esc(u.email)}</div>
+        <div>monthly income</div><div class="m">${inr(u.monthly_income)}</div><div>credit score</div><div class="m">${u.credit_score}</div>
+        <div>employment</div><div>${esc(u.employment_status)}</div><div>age</div><div class="m">${u.age}</div>
+        <div>loaded by batch</div><div class="m">${esc(u.batch_id)}</div><div>row updated</div><div class="m">${when(u.updated_at)}</div></div>
+      <h3 style="margin:22px 0 8px">${matches.length} matched product${matches.length === 1 ? '' : 's'} <span class="muted" style="font-weight:400">(Workflow B)</span></h3>
+      ${matches.map(m => `<div class="card" style="margin-bottom:10px"><div class="row"><b>${esc(m.product_name)}</b><span class="sp"></span>${srcTag(m.decision_source)}<span class="m">score ${m.score}</span></div>
+        <div class="muted" style="margin-top:4px">${esc(m.reason)}</div>
+        <div class="m faint" style="margin-top:6px; font-size:11.5px">rate ${m.interest_rate_max == null ? `from ${m.interest_rate_min ?? '?'}` : `${m.interest_rate_min}–${m.interest_rate_max}`}% · needs ${inr(m.min_monthly_income)} & score ${m.min_credit_score ?? '—'} · age ${m.min_age ?? '—'}–${m.max_age ?? '—'} · criteria ${esc(m.criteria_source)}${m.notified_at ? ` · <span class="green">emailed ${when(m.notified_at)}</span>` : ''}</div></div>`).join('') || '<p class="faint">No matches.</p>'}
+      <h3 style="margin:22px 0 8px">Emails <span class="muted" style="font-weight:400">(Workflow C · SES)</span></h3>
+      ${notifications.map(n => `<div class="kv" style="margin-bottom:10px"><div>sent</div><div class="m">${when(n.sent_at)}</div><div>to (test alias)</div><div class="m">${esc(n.sent_to)}</div>
+        <div>products</div><div class="m">${esc(n.product_ids.join(', '))}</div><div>SES MessageId</div><div class="m" style="word-break:break-all">${esc(n.ses_message_id)}</div></div>`).join('') || '<p class="faint">Not emailed (only the first few users per run are emailed in the demo).</p>'}`;
+    $('dClose').onclick = closeDrawer;
+  } catch (e) { $('drawer').innerHTML = `<p class="red">${esc(e.message)}</p>`; }
+}
+function closeDrawer() { $('drawer').classList.remove('on'); $('shade').classList.remove('on'); }
+$('shade').onclick = closeDrawer;
+addEventListener('keydown', e => e.key === 'Escape' && closeDrawer());
+
+// ---------------------------------------------------------------- workflows view
+const WF_INFO = {
+  A: ['Schedule 03:00 IST · manual · dashboard webhook', 'Crawls 7 bank pages, extracts criteria with the LLM, upserts loan_products.', 'writes loan_products, crawl_cache'],
+  B: ['Webhook from λ ingestCsv', 'SQL pre-filter → scoring + buckets → cached, batched LLM review; saves matches.', 'reads users, loan_products · writes matches, llm_decision_cache'],
+  C: ['Webhook from Workflow B', 'One email per user via the AWS SES node; recipients rewritten to test aliases.', 'reads matches · writes notifications'],
+};
+let wfTimer = null;
+async function loadWorkflows() {
+  clearTimeout(wfTimer);
+  const { workflows: wfs, ui_url } = await workflows();
+  $('wfNote').innerHTML = `editor: <a class="m" target="_blank" href="${esc(ui_url)}">${esc(ui_url)} ↗</a>`;
+  const execs = await Promise.all(['A', 'B', 'C'].map(k => api(`/api/executions?workflow=${k}&limit=8`).then(r => r.executions).catch(() => [])));
+  $('wfCards').innerHTML = ['A', 'B', 'C'].map((k, i) => {
+    const wf = wfs.find(w => w.key === k) || { name: `Workflow ${k}`, nodes: [], id: '' };
+    const [trig, what, data] = WF_INFO[k];
+    return `<div class="card k"><div class="row"><h3>${esc(wf.name)}</h3><span class="sp"></span>${wf.active ? '<span class="chip ok">active</span>' : '<span class="chip bad">inactive</span>'}</div>
+      <p class="muted" style="margin:8px 0">${what}</p>
+      <div class="kv" style="font-size:12.5px"><div>trigger</div><div>${trig}</div><div>database</div><div>${data}</div><div>nodes</div><div>${wf.nodes.length}</div></div>
+      <div class="row" style="margin:12px 0 6px"><span class="label">recent runs</span><span class="sp"></span>
+        ${k === 'A' ? '<button class="btn sm" data-runa>run now</button>' : ''}<a class="m" target="_blank" href="${n8nLink(wf.id)}">open in n8n ↗</a></div>
+      <table>${execs[i].map(e => `<tr class="click" data-exec="${e.id}"><td class="m">#${e.id}</td><td>${chip(e.status)}</td><td class="m faint">${esc(e.mode)}</td>
+        <td class="m">${when(e.startedAt)}</td><td class="m">${dur(e.startedAt, e.stoppedAt)}</td></tr>`).join('') || '<tr><td class="faint">no runs</td></tr>'}</table></div>`;
+  }).join('');
+  $('wfCards').querySelectorAll('[data-exec]').forEach(tr => tr.onclick = () => openExec(tr.dataset.exec));
+  $('wfCards').querySelector('[data-runa]')?.addEventListener('click', runA);
+  if (execs.flat().some(e => !e.finished) && document.querySelector('#v-workflows.on')) wfTimer = setTimeout(loadWorkflows, 3000);
+}
+let execTimer = null;
+async function openExec(id) {
+  clearTimeout(execTimer);
+  const pane = document.querySelector('#v-products.on') ? $('aRun') : $('execPane');
+  pane.innerHTML = '<span class="faint">loading run…</span>';
+  const ex = await api(`/api/executions/${id}`);
+  await workflows();
+  const wf = (S.workflows.workflows || []).find(w => w.id === ex.workflowId);
+  S.execView = ex; S.nodeSelExec = S.nodeSelExec || null;
+  const draw = () => {
+    const prevSel = S.nodeSel; S.nodeSel = S.nodeSelExec;
+    pane.innerHTML = `<div class="row"><h3>${esc(wf?.name || ex.workflowId)}</h3><span class="sp"></span>${ex.batch_id ? `<a class="m" href="#" data-batch="${esc(ex.batch_id)}">batch ${esc(ex.batch_id.slice(0, 8))}</a>` : ''}
+      <a class="m" target="_blank" href="${n8nLink(ex.workflowId, ex.id)}">open in n8n ↗</a></div>
+      <div style="margin-top:10px" id="execNodes">${renderRun(null, ex, wf?.nodes)}</div>`;
+    S.nodeSel = prevSel;
+    pane.querySelectorAll('[data-node]').forEach(x => x.onclick = () => { S.nodeSelExec = x.dataset.node; draw(); });
+    pane.querySelector('[data-batch]')?.addEventListener('click', e => { e.preventDefault(); go('pipeline'); selectBatch(ex.batch_id); });
+  };
+  draw();
+  if (['running', 'new'].includes(ex.status)) execTimer = setTimeout(() => openExec(id), 3000);
+}
+async function runA() {
+  try {
+    await api('/api/workflows/A/run', { method: 'POST' });
+    showErr(''); setTimeout(() => { loadWorkflows(); if (document.querySelector('#v-products.on')) loadProducts(); }, 1500);
+  } catch (e) { showErr(`Could not start Workflow A: ${e.message}`); }
+}
+$('runA').onclick = runA;
+
+// ---------------------------------------------------------------- products view (Workflow A output)
+async function loadProducts() {
+  const [{ products, crawl_cache }, ex] = await Promise.all([api('/api/products'), api('/api/executions?workflow=A&limit=1').catch(() => ({ executions: [] }))]);
+  const bySrc = products.reduce((a, p) => (a[p.criteria_source] = (a[p.criteria_source] || 0) + 1, a), {});
+  const last = products.reduce((m, p) => p.last_seen_at > m ? p.last_seen_at : m, '');
+  $('pStats').innerHTML = [[products.filter(p => p.is_active).length, 'active products'], [bySrc.llm || 0, 'criteria extracted by the LLM'],
+    [bySrc.default || 0, 'using safe defaults'], [crawl_cache.length, 'pages fingerprinted'], [when(last), 'last crawl']]
+    .map(([v, l]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
+  $('pTable').innerHTML = `<tr><th>#</th><th>lender · product</th><th>rate % p.a.</th><th>min income</th><th>credit score</th><th>age</th><th>employment</th><th>source</th><th>matches</th><th>last seen</th></tr>
+    ${products.map(p => `<tr class="click" data-p="${p.product_id}"><td class="m">${p.product_id}</td><td><b>${esc(p.lender)}</b><div class="faint">${esc(p.product_name)}</div></td>
+      <td class="m">${p.interest_rate_min == null ? '—' : p.interest_rate_max == null ? `from ${p.interest_rate_min}` : `${p.interest_rate_min} – ${p.interest_rate_max}`}</td><td class="m">${inr(p.min_monthly_income)}</td><td class="m">${p.min_credit_score ?? '—'}${p.max_credit_score ? '–' + p.max_credit_score : '+'}</td>
+      <td class="m">${p.min_age ?? '—'}–${p.max_age ?? '—'}</td><td>${esc((p.employment_types || ['any']).join(', '))}</td>
+      <td>${srcTag(p.criteria_source)}</td><td class="m">${num(p.matches)}</td><td class="m">${when(p.last_seen_at)}</td></tr>
+      <tr class="pdet" data-pd="${p.product_id}" hidden><td></td><td colspan="9" class="muted">${esc(p.other_criteria || 'no qualitative criteria extracted')}
+        ${p.source_url ? ` · <a target="_blank" href="${esc(p.source_url)}">source page ↗</a>` : ''}${p.max_loan_amount ? ` · max loan ${inr(p.max_loan_amount)}` : ''}</td></tr>`).join('')}`;
+  $('pTable').querySelectorAll('[data-p]').forEach(tr => tr.onclick = () => { const d = $('pTable').querySelector(`[data-pd="${tr.dataset.p}"]`); d.hidden = !d.hidden; });
+  $('cTable').innerHTML = `<tr><th>url</th><th>content hash</th><th>fetched</th><th>extracted (LLM)</th></tr>${crawl_cache.map(c => `<tr><td class="m" style="word-break:break-all"><a target="_blank" href="${esc(c.url)}">${esc(c.url)}</a></td>
+    <td class="m">${esc(c.content_hash)}</td><td class="m">${when(c.fetched_at)}</td><td class="m muted" style="font-size:11.5px">${esc(JSON.stringify(c.extracted)).slice(0, 220)}</td></tr>`).join('')}`;
+  const run = ex.executions[0];
+  if (run) openExec(run.id); else $('aRun').innerHTML = '<span class="faint">No Workflow A runs recorded.</span>';
+}
+
+// ---------------------------------------------------------------- emails view
+async function loadEmails() {
+  const { notifications } = await api('/api/notifications');
+  $('eTable').innerHTML = emailTable(notifications) || '<tr><td class="faint">No emails sent yet.</td></tr>';
+  bindUserRows($('eTable'));
+}
+
+// ---------------------------------------------------------------- database view
+const WRITERS = {
+  upload_batches: 'λ uploadUrl, λ ingestCsv, Workflows B and C (status)', users: 'λ ingestCsv (COPY + upsert)',
+  loan_products: 'Workflow A', crawl_cache: 'Workflow A', matches: 'Workflow B', llm_decision_cache: 'Workflow B (Stage 3)', notifications: 'Workflow C',
+};
+function renderDb() {
+  const o = S.overview; if (!o) return;
+  $('dbConn').innerHTML = `<div class="row"><h3>PostgreSQL</h3><span class="sp"></span><span class="chip ok">connected · ${o.db.latency_ms} ms</span></div>
+    <div class="kv" style="margin-top:12px"><div>host</div><div class="m" style="word-break:break-all">${esc(o.environment.db_host)}:${o.environment.db_port}</div>
+      <div>database</div><div class="m">${esc(o.db.database)}</div><div>server</div><div class="m">${esc(o.db.version)}</div>
+      <div>TLS</div><div>${o.db.ssl ? '<span class="green">encrypted (verified against the RDS CA)</span>' : 'off (local)'}</div>
+      <div>environment</div><div>${o.environment.mode === 'aws' ? 'AWS RDS, password from Secrets Manager' : 'local Docker Postgres'}</div>
+      <div>upload bucket</div><div class="m">${esc(o.environment.upload_bucket)}</div></div>`;
+  $('dbClients').innerHTML = `<h3>Who connects to it</h3><table style="margin-top:10px"><tr><th>client</th><th>how</th></tr>
+    <tr><td>λ uploadUrl · uploadStatus · ingestCsv · dashboard</td><td>pg8000 over TLS, one cached connection per container</td></tr>
+    <tr><td>n8n Workflows A, B, C</td><td>"Loan Engine Postgres" credential (created by n8n-init from .env)</td></tr>
+    <tr><td>λ migrate</td><td>applies db/schema.sql (idempotent)</td></tr>
+    <tr><td>n8n API</td><td class="m">${esc(o.n8n.api_url)} · ${o.n8n.ok ? '<span class="green">reachable</span>' : `<span class="red">${esc(o.n8n.error)}</span>`}</td></tr></table>`;
+  const t = o.db.tables, max = Math.max(...Object.values(t), 1);
+  $('dbTables').innerHTML = `<table><tr><th>table</th><th>rows</th><th style="width:40%"></th><th>written by</th></tr>${Object.entries(t).map(([k, v]) => `<tr><td class="m">${k}</td><td class="m">${num(v)}</td>
+    <td><div style="height:10px; background:#000; width:${Math.max(1, Math.log10(v + 1) / Math.log10(max + 1) * 100)}%"></div></td><td class="muted">${WRITERS[k] || ''}</td></tr>`).join('')}</table>`;
+}
+
+// ---------------------------------------------------------------- boot
+loadOverview(); setInterval(loadOverview, 8000);
+workflows().then(loadBatches);
+</script>
+</body>
+</html>
