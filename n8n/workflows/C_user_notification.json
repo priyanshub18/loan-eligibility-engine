@@ -1,0 +1,306 @@
+{
+  "id": "LoanEngineWfC0001",
+  "versionId": "66974eb4-74f8-5c41-a424-fa222889cd20",
+  "name": "C · User Notification (AWS SES)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Workflow C · Notifications\nTriggered by Workflow B when matching finishes.\n\n* One email per user, all their matches in one table\n* Recipients are **always rewritten to TEST_INBOX_ALIASES** (never the CSV address)\n* Sent with the **AWS SES node** (default). `EMAIL_USE_GMAIL=true` switches to a Gmail SMTP fallback\n* `NOTIFY_MAX_EMAILS` caps a run · only accepted emails are marked notified",
+        "width": 600,
+        "height": 280,
+        "color": 4
+      },
+      "id": "30e655da-f6b8-564b-a39b-4269b3c3325b",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        -340
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "notify-users",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "79072a97-c691-5c2c-b15a-6b433e5be154",
+      "name": "Matching finished (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        100
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "LoanEngineHookAuth",
+          "name": "Loan Engine Webhook Token"
+        }
+      },
+      "webhookId": "41fab091-7c91-5e16-998b-01a3b0112199"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Users with matches that have never been emailed, one row per user with their\n-- products pre-aggregated (so the email builder needs no extra queries).\n-- $1 = batch_id ('any' = every batch), $2 = max emails this run (demo safety cap).\nWITH pending AS (\n    SELECT m.user_id,\n           max(m.batch_id::text) AS batch_id,\n           max(m.score)          AS best_score,\n           json_agg(json_build_object(\n               'product_id', p.product_id, 'lender', p.lender, 'product_name', p.product_name,\n               'rate_min', p.interest_rate_min, 'rate_max', p.interest_rate_max,\n               'processing_fee', p.processing_fee, 'score', m.score, 'reason', m.reason,\n               'source_url', p.source_url) ORDER BY m.score DESC) AS products\n    FROM matches m\n    JOIN loan_products p USING (product_id)\n    WHERE m.notified_at IS NULL\n      AND ($1 = 'any' OR m.batch_id = NULLIF($1, 'any')::uuid)\n    GROUP BY m.user_id\n)\nSELECT u.user_id, u.name, u.email, u.monthly_income, u.credit_score, u.employment_status,\n       pending.batch_id, pending.products\nFROM pending\nJOIN users u USING (user_id)\nORDER BY json_array_length(pending.products) DESC, pending.best_score DESC\nLIMIT $2::int;\n",
+        "options": {
+          "queryReplacement": "={{ $json.body.batch_id || 'any' }},{{ $env.NOTIFY_MAX_EMAILS || 3 }}"
+        }
+      },
+      "id": "baf272ee-084d-5288-b656-e55a51440c2a",
+      "name": "Fetch users with new matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build one personalised HTML email per user (provider-agnostic: Gmail SMTP or SES).\n//\n// SAFETY: the sample CSV contains other people's addresses, so recipients are\n// ALWAYS rewritten to test-inbox aliases (round-robin over TEST_INBOX_ALIASES,\n// e.g. you+one@gmail.com,you+two@gmail.com). If none are configured we refuse\n// to send rather than fall back to the real address.\nconst aliases = String($env.TEST_INBOX_ALIASES || '').split(',').map(s => s.trim()).filter(Boolean);\nif (!aliases.length) throw new Error('TEST_INBOX_ALIASES is not set - refusing to email real user addresses');\n\nconst esc = s => String(s ?? '').replace(/[&<>\"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[c]));\nconst inr = n => `₹${Number(n).toLocaleString('en-IN')}`;\nconst rate = p => p.rate_min == null ? 'See lender' : p.rate_max ? `${p.rate_min}% – ${p.rate_max}% p.a.` : `from ${p.rate_min}% p.a.`;\n\nconst users = $input.all().filter(i => i.json.user_id);\nreturn users.map((item, idx) => {\n  const u = item.json;\n  const firstName = (u.name || 'there').split(' ')[0];\n  const products = u.products;\n\n  const rows = products.map(p => `\n      <tr>\n        <td style=\"padding:10px;border-bottom:1px solid #eee\"><strong>${esc(p.product_name)}</strong><br>\n          <span style=\"color:#666;font-size:12px\">${esc(p.lender)}</span></td>\n        <td style=\"padding:10px;border-bottom:1px solid #eee;white-space:nowrap\">${esc(rate(p))}</td>\n        <td style=\"padding:10px;border-bottom:1px solid #eee;color:#555;font-size:13px\">${esc(p.reason)}</td>\n        <td style=\"padding:10px;border-bottom:1px solid #eee\"><a href=\"${esc(p.source_url)}\" style=\"color:#0b6bcb\">Details</a></td>\n      </tr>`).join('');\n\n  const html = `<!doctype html><html><body style=\"font-family:Arial,Helvetica,sans-serif;color:#222;max-width:680px;margin:auto\">\n    <h2 style=\"color:#0b6bcb;margin-bottom:4px\">Hi ${esc(firstName)}, good news!</h2>\n    <p>Based on your profile (monthly income ${inr(u.monthly_income)}, credit score ${u.credit_score}),\n       you may qualify for <strong>${products.length} personal loan${products.length > 1 ? 's' : ''}</strong>:</p>\n    <table style=\"border-collapse:collapse;width:100%;font-size:14px\">\n      <thead><tr style=\"background:#f3f7fb;text-align:left\">\n        <th style=\"padding:10px\">Product</th><th style=\"padding:10px\">Interest rate</th>\n        <th style=\"padding:10px\">Why you match</th><th style=\"padding:10px\"></th></tr></thead>\n      <tbody>${rows}</tbody>\n    </table>\n    <p style=\"font-size:12px;color:#777;margin-top:24px\">This is an indicative pre-qualification based on publicly\n       listed criteria, not a loan offer. Final approval is at the lender's discretion.<br>\n       [Demo] Original recipient: ${esc(u.email)} · user ${esc(u.user_id)}</p>\n  </body></html>`;\n\n  return {\n    json: {\n      user_id: u.user_id,\n      batch_id: u.batch_id,\n      product_ids: products.map(p => p.product_id),\n      to: aliases[idx % aliases.length],\n      subject: `${firstName}, you may qualify for ${products.length} personal loan${products.length > 1 ? 's' : ''}`,\n      html,\n    },\n  };\n});\n"
+      },
+      "id": "46430e4b-9867-584c-a70b-f8f09ddffef9",
+      "name": "Build personalised emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "738672e7-f5e9-53e1-a3d3-8d2608750ff7",
+              "leftValue": "={{ String($env.EMAIL_USE_GMAIL ?? 'false').toLowerCase() !== 'true' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2fcc8b01-0982-5c4b-a8df-65a3e8797b75",
+      "name": "Send via AWS SES?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.EMAIL_FROM_NAME || 'Loan Eligibility Engine' }} <{{ $env.GMAIL_SMTP_USER }}>",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ca21672a-1ec7-5980-b34e-16ae8e9b70a8",
+      "name": "Send via Gmail SMTP",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        960,
+        200
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "LoanEngineGmailSmtp",
+          "name": "Loan Engine Gmail SMTP"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "isBodyHtml": true,
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "fromEmail": "={{ $env.SES_FROM_EMAIL }}",
+        "toAddresses": [
+          "={{ $json.to }}"
+        ],
+        "additionalFields": {}
+      },
+      "id": "98e9df42-7a93-5cf7-a99a-6eaa101a3982",
+      "name": "Send via AWS SES",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        960,
+        0
+      ],
+      "credentials": {
+        "aws": {
+          "id": "LoanEngineAwsSes1",
+          "name": "Loan Engine AWS (SES)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pair each provider response (Gmail SMTP or SES - only one branch runs) with\n// the email it belongs to. Only accepted emails are logged and marked as\n// notified; failures stay pending and are retried on the next run.\nconst emails = $('Build personalised emails').all().map(i => i.json);\nconst sent = [];\nconst failed = [];\n$input.all().forEach((item, idx) => {\n  const r = item.json;\n  const messageId = r.messageId /* SMTP (nodemailer) */ || r.MessageId || r.SendEmailResult?.MessageId || r.SendEmailResponse?.SendEmailResult?.MessageId;\n  const e = emails[idx];\n  if (messageId) sent.push({ user_id: e.user_id, sent_to: e.to, product_ids: e.product_ids, batch_id: e.batch_id, ses_message_id: messageId });\n  else failed.push({ user_id: e.user_id, error: r.error?.message || r.error || 'no MessageId' });\n});\nconst batchId = $('Matching finished (webhook)').first().json.body?.batch_id || emails[0]?.batch_id || null;\nreturn [{ json: { batch_id: batchId, sent_json: JSON.stringify(sent), sent: sent.length, failed,\n                  first_error: failed[0] ? `${failed.length} email(s) failed: ${failed[0].error}` : '' } }];\n"
+      },
+      "id": "cc0f98a9-e270-5360-9f90-17f3b3c6de96",
+      "name": "Collect send results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Log the sends, stamp the matches as notified and close out the batch, atomically.\n-- $1 = sent rows (JSON), $2 = batch_id, $3 = JSON-encoded error summary ('' if none).\nWITH sent AS (\n    SELECT * FROM jsonb_to_recordset($1::jsonb)\n        AS x(user_id text, sent_to text, product_ids int[], batch_id uuid, ses_message_id text)\n),\nlogged AS (\n    INSERT INTO notifications (user_id, sent_to, product_ids, batch_id, ses_message_id)\n    SELECT user_id, sent_to, product_ids, batch_id, ses_message_id FROM sent\n    RETURNING 1\n),\nstamped AS (\n    UPDATE matches m SET notified_at = now()\n    FROM sent\n    WHERE m.user_id = sent.user_id AND m.product_id = ANY (sent.product_ids)\n    RETURNING 1\n),\nbatch AS (\n    -- 'notified' if at least one email went out, otherwise surface the SES error to the UI\n    UPDATE upload_batches\n    SET status = CASE WHEN (SELECT count(*) FROM sent) > 0 THEN 'notified' ELSE 'notify_failed' END,\n        error = NULLIF($3::jsonb #>> '{}', ''),   -- $3 arrives JSON-encoded (may contain commas)\n        updated_at = now(),\n        match_stats = COALESCE(match_stats, '{}'::jsonb) || jsonb_build_object('emails_sent', (SELECT count(*) FROM sent))\n    WHERE batch_id IN (SELECT DISTINCT batch_id FROM sent) OR batch_id::text = $2\n    RETURNING 1\n)\nSELECT (SELECT count(*) FROM logged)::int  AS emails_logged,\n       (SELECT count(*) FROM stamped)::int AS matches_marked,\n       (SELECT count(*) FROM batch)::int   AS batches_closed;\n",
+        "options": {
+          "queryReplacement": "={{ $json.sent_json }},{{ $json.batch_id || 'none' }},{{ JSON.stringify($json.first_error) }}"
+        }
+      },
+      "id": "b8ba500a-0de7-5fb5-91f8-884bfa223267",
+      "name": "Mark matches notified",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1440,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Matching finished (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Fetch users with new matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch users with new matches": {
+      "main": [
+        [
+          {
+            "node": "Build personalised emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build personalised emails": {
+      "main": [
+        [
+          {
+            "node": "Send via AWS SES?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via AWS SES?": {
+      "main": [
+        [
+          {
+            "node": "Send via AWS SES",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send via Gmail SMTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via Gmail SMTP": {
+      "main": [
+        [
+          {
+            "node": "Collect send results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via AWS SES": {
+      "main": [
+        [
+          {
+            "node": "Collect send results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect send results": {
+      "main": [
+        [
+          {
+            "node": "Mark matches notified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "saveManualExecutions": true
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

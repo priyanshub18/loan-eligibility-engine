@@ -1,0 +1,494 @@
+{
+  "id": "LoanEngineWfB0001",
+  "versionId": "219d7143-e2e4-515a-985c-89524a40b6db",
+  "name": "B · User-Loan Matching (3-stage funnel)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Workflow B · Optimised matching funnel\n**Stage 1 – SQL:** hard criteria as JOIN predicates in Postgres (cross-product never leaves the DB)\n\n**Stage 2 – JS:** score, FOIR affordability, keep top-K per user, split clear vs borderline\n\n**Stage 3 – LLM:** only borderline pairs, collapsed into profile buckets, cached across runs, 25 questions per call, hard call budget\n\nFunnel numbers are saved to `upload_batches.match_stats`.",
+        "width": 620,
+        "height": 300,
+        "color": 4
+      },
+      "id": "77386bea-b91f-59ab-bb6a-c191fca91015",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "loan-matching",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "b429b8cd-9cbf-5972-aeda-75022dc4e8d6",
+      "name": "Batch ingested (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        100
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "LoanEngineHookAuth",
+          "name": "Loan Engine Webhook Token"
+        }
+      },
+      "webhookId": "ff28dc68-9a00-527a-b89d-5361e3c4ce3e"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The webhook is already authenticated (Header Auth credential); here we only\n// make sure the payload is a real batch id before touching the database.\nconst batchId = String($json.body?.batch_id ?? $json.batch_id ?? '').trim().toLowerCase();\nif (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(batchId)) {\n  throw new Error(`Invalid or missing batch_id in webhook payload: ${JSON.stringify($json.body ?? {})}`);\n}\nreturn { json: { batch_id: batchId, started_at: new Date().toISOString() } };\n"
+      },
+      "id": "4f899217-11b4-5e5a-9603-f0a1d672d3a9",
+      "name": "Validate payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE upload_batches SET status = 'matching', updated_at = now() WHERE batch_id = $1::uuid RETURNING batch_id::text;",
+        "options": {
+          "queryReplacement": "={{ $json.batch_id }}"
+        }
+      },
+      "id": "b945bdc7-ec54-5a81-ad1a-230d7ef9a076",
+      "name": "Mark batch: matching",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        440,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STAGE 1 - set-based hard filter inside PostgreSQL.\n-- Every numeric/categorical rule is applied as a JOIN predicate, so the\n-- users x products cross-product is never materialised in n8n: Postgres\n-- returns only the pairs that satisfy all hard criteria, in one round-trip.\n-- Pairs come back as compact arrays inside ONE row (not one n8n item per pair),\n-- which keeps n8n's per-item overhead out of the hot path.\nWITH batch_users AS (\n    SELECT user_id, monthly_income, credit_score, age, employment_status\n    FROM users\n    WHERE batch_id = $1::uuid\n),\nproducts AS (\n    SELECT product_id, lender, product_name, interest_rate_min, interest_rate_max,\n           min_monthly_income, min_credit_score, max_credit_score, min_age, max_age,\n           employment_types, max_loan_amount, other_criteria, criteria_source\n    FROM loan_products\n    WHERE is_active\n),\ncandidates AS (\n    SELECT u.user_id, p.product_id, u.monthly_income, u.credit_score, u.age, u.employment_status\n    FROM batch_users u\n    JOIN products p\n      ON  u.monthly_income >= COALESCE(p.min_monthly_income, 0)\n      AND u.credit_score BETWEEN COALESCE(p.min_credit_score, 300) AND COALESCE(p.max_credit_score, 900)\n      AND u.age          BETWEEN COALESCE(p.min_age, 18)          AND COALESCE(p.max_age, 100)\n      AND (p.employment_types IS NULL OR u.employment_status = ANY (p.employment_types))\n)\nSELECT\n    $1::text                                        AS batch_id,\n    (SELECT count(*) FROM batch_users)::int         AS users_in_batch,\n    (SELECT count(*) FROM products)::int            AS products_active,\n    (SELECT count(*) FROM candidates)::int          AS stage1_pairs,\n    (SELECT COALESCE(json_agg(row_to_json(p)), '[]'::json) FROM products p) AS products,\n    (SELECT COALESCE(json_agg(json_build_array(user_id, product_id, monthly_income,\n                                               credit_score, age, employment_status)), '[]'::json)\n       FROM candidates)                             AS pairs;\n",
+        "options": {
+          "queryReplacement": "={{ $json.batch_id }}"
+        }
+      },
+      "id": "36ab7c60-ea41-573e-a5fe-b5d5ebbf6574",
+      "name": "Stage 1 · SQL pre-filter",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        660,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// STAGE 2 - deterministic scoring, top-K pruning and borderline detection (pure JS, O(pairs)).\n//\n// 1. Score every Stage-1 pair 0-100 from credit headroom, income headroom,\n//    the product's best rate and an affordability check (FOIR).\n// 2. Keep only each user's top-K products: nobody needs an email with 14 loans,\n//    and every pair we drop here is a pair the LLM never has to look at.\n// 3. Split survivors into CLEAR (comfortably eligible -> accepted, no LLM) and\n//    BORDERLINE (within a hair of a threshold -> qualitative LLM review).\n// 4. Collapse borderline pairs into coarse PROFILE BUCKETS\n//    (product x employment x ONLY the dimensions that are actually borderline:\n//    a credit-borderline user is bucketed by credit band, and their income is\n//    just \"comfortably above minimum\"). Users in the same bucket get the same\n//    answer, so the LLM is asked once per bucket, not once per user - and that\n//    answer is cached across batches.\n\nconst s1 = $input.first().json;\nconst MAX_PER_USER = Number($env.MAX_MATCHES_PER_USER || 5);\nconst FOIR = 0.5;          // max share of income that may go to EMIs (RBI-style fixed-obligation ratio)\nconst TENURE_MONTHS = 60;\nconst MIN_USEFUL_LOAN = 50000; // if the user can't service even this, the match is pointless\n\nconst products = new Map(s1.products.map(p => [p.product_id, p]));\nconst clamp01 = x => Math.max(0, Math.min(1, x));\nconst band = (v, w) => Math.floor(v / w) * w;\nconst emiPerRupee = (ratePct, n) => { const r = ratePct / 1200; return r ? r / (1 - Math.pow(1 + r, -n)) : 1 / n; };\n\nconst byUser = new Map();\nlet droppedUnaffordable = 0;\n\nfor (const [userId, productId, incomeRaw, credit, age, emp] of s1.pairs) {\n  const p = products.get(productId);\n  const income = Number(incomeRaw);\n  const minIncome = Number(p.min_monthly_income || 0);\n  const minCredit = Number(p.min_credit_score || 300);\n  const rate = Number(p.interest_rate_max ?? p.interest_rate_min ?? 16); // be conservative: assume worst rate\n\n  const affordableLoan = (income * FOIR) / emiPerRupee(rate, TENURE_MONTHS);\n  if (affordableLoan < MIN_USEFUL_LOAN) { droppedUnaffordable++; continue; }\n\n  const creditHeadroom = Number(credit) - minCredit;\n  const incomeHeadroom = minIncome ? income / minIncome - 1 : 1;\n  const ageEdge = age - (p.min_age ?? 18) <= 1 ? 'min' : (p.max_age ?? 100) - age <= 1 ? 'max' : 'mid';\n\n  let score = 100 * (0.40 * clamp01(creditHeadroom / 100)\n                   + 0.30 * clamp01(incomeHeadroom)\n                   + 0.30 * clamp01((24 - Number(p.interest_rate_min ?? 16)) / 16));\n  if (p.criteria_source === 'default') score *= 0.85; // lender didn't publish criteria: less confident\n\n  const reasons = [];\n  if (creditHeadroom < 20) reasons.push(`credit score ${credit} is within 20 of the ${minCredit} minimum`);\n  if (minIncome && incomeHeadroom < 0.10) reasons.push(`income ${income} is within 10% of the ${minIncome} minimum`);\n  if (ageEdge !== 'mid') reasons.push(`age ${age} is at the ${ageEdge} edge of ${p.min_age}-${p.max_age}`);\n\n  const list = byUser.get(userId) || [];\n  list.push({ userId, productId, score: Math.round(score * 100) / 100, reasons, income, credit, age, emp, ageEdge,\n              maxLoan: Math.round(Math.min(affordableLoan, Number(p.max_loan_amount) || Infinity)) });\n  byUser.set(userId, list);\n}\n\nconst clear = [];       // [userId, productId, score, maxLoan]\nconst borderline = [];  // [userId, productId, score, maxLoan, bucketKey]\nconst questions = {};   // bucketKey -> what the LLM needs to judge it\nlet afterTopK = 0;\n\nfor (const list of byUser.values()) {\n  list.sort((a, b) => b.score - a.score);\n  for (const m of list.slice(0, MAX_PER_USER)) {\n    afterTopK++;\n    if (!m.reasons.length) { clear.push([m.userId, m.productId, m.score, m.maxLoan]); continue; }\n    const incBand = band(m.income, 5000), csBand = band(m.credit, 10);\n    const flagged = { income: m.reasons.some(r => r.startsWith('income')),\n                      credit: m.reasons.some(r => r.startsWith('credit')), age: m.ageEdge !== 'mid' };\n    const profile = {\n      monthly_income: flagged.income ? `${incBand}-${incBand + 4999}` : 'comfortably above minimum',\n      credit_score: flagged.credit ? `${csBand}-${csBand + 9}` : 'comfortably above minimum',\n      employment: m.emp,\n      age: flagged.age ? m.age : 'within range',\n    };\n    const key = `v2|p${m.productId}|${m.emp}|inc:${flagged.income ? incBand : 'ok'}|cs:${flagged.credit ? csBand : 'ok'}|age:${flagged.age ? m.age : 'ok'}`;\n    borderline.push([m.userId, m.productId, m.score, m.maxLoan, key]);\n    if (!questions[key]) questions[key] = { product_id: m.productId, profile, flags: m.reasons.map(r => r.replace(/\\d+ is/, 'is')) };\n  }\n}\n\nconst stats = {\n  users_in_batch: s1.users_in_batch,\n  products_active: s1.products_active,\n  naive_pairs: s1.users_in_batch * s1.products_active,\n  stage1_sql_pairs: s1.stage1_pairs,\n  stage2_dropped_unaffordable: droppedUnaffordable,\n  stage2_after_top_k: afterTopK,\n  stage2_clear: clear.length,\n  stage2_borderline: borderline.length,\n  stage3_unique_questions: Object.keys(questions).length,\n};\n\nreturn [{ json: { batch_id: s1.batch_id, products: s1.products, clear, borderline, questions,\n                  question_keys_json: JSON.stringify(Object.keys(questions)), stats } }];\n"
+      },
+      "id": "22cd8426-3c63-58c6-a1fb-d8728f080193",
+      "name": "Stage 2 · Score, top-K, bucket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STAGE 3a - reuse earlier LLM verdicts for identical (product, profile-bucket) questions.\nSELECT cache_key, eligible, reason\nFROM llm_decision_cache\nWHERE cache_key IN (SELECT jsonb_array_elements_text($1::jsonb));\n",
+        "options": {
+          "queryReplacement": "={{ $json.question_keys_json }}"
+        }
+      },
+      "id": "7d4c184f-a49f-5b63-945f-c5d5ce1266fd",
+      "name": "LLM cache lookup",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1100,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// STAGE 3b - batch the cache misses into a few LLM calls.\n// 25 questions per request and a hard per-run call budget keep latency and\n// cost bounded no matter how large the upload is. Questions over budget are\n// not dropped: they fall back to the rules verdict and get asked next run.\nconst s2 = $('Stage 2 · Score, top-K, bucket').first().json;\nconst cached = new Set($input.all().map(i => i.json.cache_key).filter(Boolean));\nconst misses = Object.keys(s2.questions).filter(k => !cached.has(k));\n\nconst PER_CALL = 25;\nconst MAX_CALLS = Number($env.LLM_MAX_CALLS_PER_RUN || 20);\nif (!$env.LLM_API_KEY || !misses.length) {\n  return [{ json: { skip: true, misses: misses.length, cache_hits: cached.size, reason: $env.LLM_API_KEY ? 'no cache misses' : 'LLM disabled' } }];\n}\n\nconst products = new Map(s2.products.map(p => [p.product_id, p]));\nconst describe = p => ({\n  product_id: p.product_id, lender: p.lender, product: p.product_name,\n  min_monthly_income: p.min_monthly_income, min_credit_score: p.min_credit_score,\n  age: `${p.min_age}-${p.max_age}`, employment_types: p.employment_types ?? 'any',\n  other_criteria: p.other_criteria ?? 'none published',\n});\n\nconst SYSTEM = `You are a conservative credit analyst for Indian unsecured personal loans.\nEach case is an applicant PROFILE (ranges, not a single person) that already passes the lender's\nhard minimums but sits close to a threshold. Decide if a typical applicant in that profile is\nLIKELY to be approved, considering the lender's qualitative criteria, the borderline flags and\nstandard Indian lending practice (bureau score cut-offs, FOIR, employment stability).\nAnswer ONLY with JSON: {\"decisions\":[{\"id\":\"<case id>\",\"eligible\":true|false,\"reason\":\"<= 20 words\"}]}`;\n\nconst toAsk = misses.slice(0, PER_CALL * MAX_CALLS);\nconst calls = [];\nfor (let i = 0; i < toAsk.length; i += PER_CALL) {\n  const chunk = toAsk.slice(i, i + PER_CALL);\n  const productIds = [...new Set(chunk.map(k => s2.questions[k].product_id))];\n  const cases = chunk.map((k, j) => ({ id: `c${j + 1}`, ...s2.questions[k] }));\n  calls.push({\n    json: {\n      keys: chunk,\n      llm_request: {\n        model: $env.LLM_MODEL || 'gemini-3.5-flash-lite',\n        temperature: 0,\n        messages: [\n          { role: 'system', content: SYSTEM },\n          { role: 'user', content: JSON.stringify({ products: productIds.map(id => describe(products.get(id))), cases }) },\n        ],\n      },\n    },\n  });\n}\nreturn calls;\n"
+      },
+      "id": "a8d4eae5-3f38-5276-94a9-7c8c22dc2416",
+      "name": "Plan LLM batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c48800a1-e359-5ecd-b8da-bc170e9e9462",
+              "leftValue": "={{ $json.skip === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "70ec6fad-9e48-5c20-ae1e-0a1653a0682a",
+      "name": "LLM work needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_BASE_URL }}/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.LLM_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 4000
+            }
+          }
+        }
+      },
+      "id": "42ec8963-88df-5d06-8c70-20ea432adb2f",
+      "name": "Stage 3 · LLM borderline review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1760,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map the LLM's short case ids (\"c1\"..\"c25\") back to bucket keys.\n// One output item carrying all verdicts, ready for a single bulk cache insert.\nconst s2 = $('Stage 2 · Score, top-K, bucket').first().json;\nconst plans = $('Plan LLM batches').all().map(i => i.json);\n\nconst rows = [];\nlet failedCalls = 0;\n$input.all().forEach((item, idx) => {\n  const keys = plans[idx].keys;\n  const text = item.json.choices?.[0]?.message?.content || '';\n  let decisions = [];\n  try { decisions = JSON.parse(text.match(/\\{[\\s\\S]*\\}/)[0]).decisions || []; } catch { failedCalls++; return; }\n  for (const d of decisions) {\n    const key = keys[Number(String(d.id).replace(/\\D/g, '')) - 1];\n    if (!key || typeof d.eligible !== 'boolean') continue;\n    rows.push({ cache_key: key, product_id: s2.questions[key].product_id, eligible: d.eligible,\n                reason: String(d.reason || '').slice(0, 300), model: plans[idx].llm_request.model });\n  }\n});\n\nreturn [{ json: { rows_json: JSON.stringify(rows), verdicts: rows.length, llm_calls: plans.length, failed_calls: failedCalls } }];\n"
+      },
+      "id": "7504bbd0-fb8f-5194-bad3-1095f70ce1b1",
+      "name": "Parse LLM verdicts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO llm_decision_cache (cache_key, product_id, eligible, reason, model)\nSELECT cache_key, product_id, eligible, reason, model\nFROM jsonb_to_recordset($1::jsonb) AS x(cache_key text, product_id int, eligible boolean, reason text, model text)\nON CONFLICT (cache_key) DO UPDATE\n    SET eligible = EXCLUDED.eligible, reason = EXCLUDED.reason, model = EXCLUDED.model, created_at = now()\nRETURNING cache_key;\n",
+        "options": {
+          "queryReplacement": "={{ $json.rows_json }}"
+        }
+      },
+      "id": "b073b60e-b463-5337-b8e3-4a93937e95f4",
+      "name": "Save verdicts to cache",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2200,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      },
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Final decision per pair:\n//   clear pair                         -> match (decision_source = rules)\n//   borderline + LLM said eligible     -> match (llm / llm_cache) with the LLM's reason\n//   borderline + LLM said NOT eligible -> rejected\n//   borderline + no verdict available  -> match (rules_fallback) - hard criteria already passed\n// Runs exactly once whichever IF branch was taken (LLM or skip).\nconst s2 = $('Stage 2 · Score, top-K, bucket').first().json;\n\nconst verdicts = new Map();\nfor (const i of $('LLM cache lookup').all()) {\n  if (i.json.cache_key) verdicts.set(i.json.cache_key, { ...i.json, source: 'llm_cache' });\n}\nlet llmMeta = { llm_calls: 0, failed_calls: 0 };\ntry {\n  const parsed = $('Parse LLM verdicts').first().json;\n  for (const r of JSON.parse(parsed.rows_json)) verdicts.set(r.cache_key, { ...r, source: 'llm' });\n  llmMeta = { llm_calls: parsed.llm_calls, failed_calls: parsed.failed_calls };\n} catch (e) { /* LLM branch skipped */ }\n\nconst matches = s2.clear.map(([user_id, product_id, score, maxLoan]) => ({\n  user_id, product_id, score, decision_source: 'rules',\n  reason: `Meets all published criteria; est. affordable loan up to ₹${maxLoan.toLocaleString('en-IN')}`,\n}));\n\nlet rejected = 0, fallback = 0, cacheHits = 0;\nfor (const [user_id, product_id, score, maxLoan, key] of s2.borderline) {\n  const v = verdicts.get(key);\n  if (!v) {\n    fallback++;\n    matches.push({ user_id, product_id, score, decision_source: 'rules_fallback',\n                   reason: 'Borderline on a threshold; passes all hard criteria' });\n  } else if (v.eligible) {\n    if (v.source === 'llm_cache') cacheHits++;\n    matches.push({ user_id, product_id, score, decision_source: v.source, reason: v.reason });\n  } else {\n    rejected++;\n  }\n}\n\nconst stats = {\n  ...s2.stats,\n  stage3_cache_hit_buckets: $('LLM cache lookup').all().filter(i => i.json.cache_key).length,\n  stage3_llm_calls: llmMeta.llm_calls,\n  stage3_llm_failed_calls: llmMeta.failed_calls,\n  stage3_llm_rejected_pairs: rejected,\n  stage3_rules_fallback_pairs: fallback,\n  stage3_pairs_from_cache: cacheHits,\n  final_matches: matches.length,\n  users_matched: new Set(matches.map(m => m.user_id)).size,\n  duration_ms: Date.now() - new Date($('Validate payload').first().json.started_at).getTime(),\n};\n\nreturn [{ json: { batch_id: s2.batch_id, matches_json: JSON.stringify(matches), stats_json: JSON.stringify(stats), stats } }];\n"
+      },
+      "id": "49740c70-e7e6-5b4e-a252-e8da6c8295c9",
+      "name": "Assemble final matches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        100
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Bulk-insert all matches and close out the batch in a single statement.\n-- Re-uploaded users: un-notified matches that no longer qualify are pruned.\nWITH incoming AS (\n    SELECT * FROM jsonb_to_recordset($2::jsonb)\n        AS x(user_id text, product_id int, score numeric, decision_source text, reason text)\n),\nstale AS (\n    DELETE FROM matches m\n    USING users u\n    WHERE u.user_id = m.user_id AND u.batch_id = $1::uuid AND m.notified_at IS NULL\n      AND NOT EXISTS (SELECT 1 FROM incoming i WHERE i.user_id = m.user_id AND i.product_id = m.product_id)\n    RETURNING 1\n),\nsaved AS (\n    INSERT INTO matches (user_id, product_id, batch_id, score, decision_source, reason)\n    SELECT user_id, product_id, $1::uuid, score, decision_source, reason FROM incoming\n    ON CONFLICT (user_id, product_id) DO UPDATE\n        SET score = EXCLUDED.score, decision_source = EXCLUDED.decision_source,\n            reason = EXCLUDED.reason, batch_id = EXCLUDED.batch_id\n    RETURNING 1\n)\nUPDATE upload_batches\nSET status = 'matched', match_stats = $3::jsonb, updated_at = now()\nWHERE batch_id = $1::uuid\nRETURNING batch_id::text, (SELECT count(*) FROM saved)::int AS matches_saved,\n          (SELECT count(*) FROM stale)::int AS stale_matches_removed;\n",
+        "options": {
+          "queryReplacement": "={{ $json.batch_id }},{{ $json.matches_json }},{{ $json.stats_json }}"
+        }
+      },
+      "id": "40d94128-5c0e-5837-8dc3-6ff2302a6380",
+      "name": "Save matches + funnel stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2640,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/webhook/notify-users",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Webhook-Token",
+              "value": "={{ $env.N8N_WEBHOOK_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ batch_id: $json.batch_id }) }}",
+        "options": {}
+      },
+      "id": "c9cfd856-6b59-500b-9dd9-de700b7cd5bf",
+      "name": "Trigger Workflow C",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2860,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Batch ingested (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Validate payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate payload": {
+      "main": [
+        [
+          {
+            "node": "Mark batch: matching",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark batch: matching": {
+      "main": [
+        [
+          {
+            "node": "Stage 1 · SQL pre-filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 1 · SQL pre-filter": {
+      "main": [
+        [
+          {
+            "node": "Stage 2 · Score, top-K, bucket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 2 · Score, top-K, bucket": {
+      "main": [
+        [
+          {
+            "node": "LLM cache lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM cache lookup": {
+      "main": [
+        [
+          {
+            "node": "Plan LLM batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan LLM batches": {
+      "main": [
+        [
+          {
+            "node": "LLM work needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM work needed?": {
+      "main": [
+        [
+          {
+            "node": "Stage 3 · LLM borderline review",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assemble final matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 3 · LLM borderline review": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM verdicts": {
+      "main": [
+        [
+          {
+            "node": "Save verdicts to cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save verdicts to cache": {
+      "main": [
+        [
+          {
+            "node": "Assemble final matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble final matches": {
+      "main": [
+        [
+          {
+            "node": "Save matches + funnel stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save matches + funnel stats": {
+      "main": [
+        [
+          {
+            "node": "Trigger Workflow C",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "saveManualExecutions": true
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

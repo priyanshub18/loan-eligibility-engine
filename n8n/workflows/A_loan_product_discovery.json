@@ -1,0 +1,459 @@
+{
+  "id": "LoanEngineWfA0001",
+  "versionId": "a0d4c7bb-801d-5994-9136-bc87ce537de4",
+  "name": "A · Loan Product Discovery (daily crawler)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Workflow A · Loan product discovery\nDaily crawl of **BankBazaar** (rate table + lender pages) and **ICICI Bank** (official page).\n\n1. Fetch HTML politely (1 req/s, retries)\n2. Strip to ~3 KB eligibility snippet + regex heuristics\n3. Hash snippet → **skip the LLM if the page is unchanged**\n4. LLM extracts structured criteria (JSON)\n5. Merge sources (official > aggregator; LLM > cache > regex) → one bulk upsert",
+        "width": 560,
+        "height": 280,
+        "color": 4
+      },
+      "id": "885d3a3d-ab7c-5c9d-b287-9eed6bb931a6",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 3 * * *"
+            }
+          ]
+        }
+      },
+      "id": "162899ae-80b0-595e-ad0e-15f75d052916",
+      "name": "Daily 03:00 IST",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "a62514fd-1bc7-566c-88a9-61785f39a146",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crawl-products",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "1229824e-442f-5c3d-8ac6-bc7f593d81fe",
+      "name": "Run via dashboard (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        400
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "LoanEngineHookAuth",
+          "name": "Loan Engine Webhook Token"
+        }
+      },
+      "webhookId": "d40c6eef-f77f-55a1-a3ab-c89da77985d0"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Crawl plan. Two sites, chosen because they are server-rendered (no headless\n// browser needed) and cover both an aggregator and a lender's own page:\n//   1. BankBazaar - one rate-comparison table (many lenders at once) plus\n//      per-lender pages that carry the eligibility criteria.\n//   2. ICICI Bank  - the lender's official eligibility page; official values\n//      take precedence over the aggregator when both are present.\nconst BB = 'https://www.bankbazaar.com';\n\nconst targets = [\n  { kind: 'rate_table', source: 'bankbazaar', url: `${BB}/personal-loan-interest-rate.html` },\n  { kind: 'lender_page', source: 'bankbazaar', lender: 'HDFC Bank', url: `${BB}/hdfc-personal-loan.html` },\n  { kind: 'lender_page', source: 'bankbazaar', lender: 'State Bank of India', url: `${BB}/sbi-personal-loan.html` },\n  { kind: 'lender_page', source: 'bankbazaar', lender: 'ICICI Bank', url: `${BB}/icici-personal-loan.html` },\n  { kind: 'lender_page', source: 'bankbazaar', lender: 'Kotak Mahindra Bank', url: `${BB}/kotak-personal-loan.html` },\n  { kind: 'lender_page', source: 'bankbazaar', lender: 'Bajaj Finserv', url: `${BB}/bajaj-finserv-personal-loan.html` },\n  { kind: 'lender_page', source: 'official', lender: 'ICICI Bank',\n    url: 'https://www.icicibank.com/personal-banking/loans/personal-loan/eligibility' },\n];\n\nreturn targets.map(t => ({ json: t }));\n"
+      },
+      "id": "b7dc7bff-741a-5371-bb85-f502618f5668",
+      "name": "Crawl targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (compatible; LoanEligibilityEngine/1.0; educational project)"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-IN,en;q=0.9"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "html"
+            }
+          },
+          "timeout": 20000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1000
+            }
+          }
+        }
+      },
+      "id": "f8f28ca7-931b-53cb-aec4-3980cf88d36e",
+      "name": "Fetch page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        100
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns raw HTML into (a) rate-table rows and (b) a compact eligibility\n// snippet per lender page, plus cheap regex \"heuristic\" extraction.\n//\n// Cost trick #1: the LLM never sees a full page. We keep only ~3 KB of text\n// around eligibility keywords (pages are 200 KB - 1.2 MB of HTML), which cuts\n// tokens by ~98% and also improves extraction accuracy (less noise).\n// Cost trick #2: a content hash of that snippet lets the next node skip the\n// LLM entirely when the page has not changed since the last crawl.\n\nconst targets = $('Crawl targets').all().map(i => i.json);\nconst pages = $input.all();\n\n// ---------------------------------------------------------------- helpers\nconst ENTITIES = { '&amp;': '&', '&nbsp;': ' ', '&lt;': '<', '&gt;': '>', '&quot;': '\"', '&#39;': \"'\", '&#8377;': '₹', '&rsquo;': \"'\", '&ndash;': '-', '&mdash;': '-' };\nconst decode = s => s.replace(/&[#a-z0-9]+;/gi, m => ENTITIES[m.toLowerCase()] ?? ' ');\n\nfunction htmlToText(html) {\n  return decode(\n    html.replace(/<(script|style|noscript|svg|header|footer|nav)[\\s\\S]*?<\\/\\1>/gi, ' ')\n        .replace(/<[^>]+>/g, ' ')\n  ).replace(/\\s+/g, ' ').trim();\n}\n\n// cyrb53: fast 53-bit string hash - plenty for change detection, no crypto module needed.\nfunction hash(str) {\n  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;\n  for (let i = 0; i < str.length; i++) {\n    const ch = str.charCodeAt(i);\n    h1 = Math.imul(h1 ^ ch, 2654435761);\n    h2 = Math.imul(h2 ^ ch, 1597334677);\n  }\n  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);\n  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);\n  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);\n}\n\nconst num = s => Number(String(s).replace(/,/g, ''));\n\nfunction parseRates(text) {\n  // first \"a% - b%\" range that looks like an interest rate (skips fee ranges such as \"0% - 6%\")\n  for (const m of text.matchAll(/(\\d{1,2}(?:\\.\\d{1,2})?)\\s*%(?:\\s*p\\.a\\.?)?\\s*(?:to|-|–)\\s*(\\d{1,2}(?:\\.\\d{1,2})?)\\s*%/gi)) {\n    const lo = num(m[1]), hi = num(m[2]);\n    if (lo >= 5 && hi <= 45 && hi >= lo) return { interest_rate_min: lo, interest_rate_max: hi };\n  }\n  const single = text.match(/(\\d{1,2}(?:\\.\\d{1,2})?)\\s*%\\s*p\\.a\\./i);\n  return single && num(single[1]) >= 5 ? { interest_rate_min: num(single[1]), interest_rate_max: null } : {};\n}\n\nfunction parseRateTable(html) {\n  const tables = html.match(/<table[\\s\\S]*?<\\/table>/gi) || [];\n  for (const table of tables) {\n    const rows = (table.match(/<tr[\\s\\S]*?<\\/tr>/gi) || []).map(r =>\n      (r.match(/<t[dh][\\s\\S]*?<\\/t[dh]>/gi) || []).map(c => htmlToText(c)));\n    if (!rows.length || !/interest/i.test(rows[0].join(' '))) continue;\n    return rows.slice(1)\n      .filter(r => r.length >= 2 && r[0] && /\\d/.test(r[1]))\n      .map(r => ({ lender: r[0], processing_fee: r[2] || null, ...parseRates(r[1]) }));\n  }\n  return [];\n}\n\nconst KEYWORDS = /eligib|minimum (net )?(monthly )?(income|salary)|credit score|cibil|age (limit|criteria|of)|years of age|salaried|self[- ]employed|work experience|loan amount/gi;\n\n// Facts look like \"Rs. 25,000\", \"750\", \"21 years\", \"10.5%\": windows dense in them are\n// eligibility tables; windows without them are navigation menus or marketing copy.\nconst FACT = /(?:rs\\.?|₹|inr)\\s*[\\d,]{4,}|\\b[3-9]\\d{2}\\b|\\b\\d{2}\\s*years|\\d%/gi;\n\nfunction eligibilitySnippet(text, maxLen = 3500) {\n  const windows = [];\n  for (const m of text.matchAll(KEYWORDS)) {\n    const start = Math.max(0, m.index - 200), end = Math.min(text.length, m.index + 300);\n    const last = windows[windows.length - 1];\n    if (last && start <= last.end) last.end = end; else windows.push({ start, end });\n  }\n  // keep the most fact-dense windows that fit the budget, then restore page order\n  const ranked = windows\n    .map(w => ({ ...w, facts: (text.slice(w.start, w.end).match(FACT) || []).length }))\n    .filter(w => w.facts > 0)\n    .sort((a, b) => b.facts / (b.end - b.start) - a.facts / (a.end - a.start));\n  const picked = [];\n  let used = 0;\n  for (const w of ranked) {\n    const len = Math.min(w.end - w.start, 800);\n    if (used + len > maxLen) continue;\n    picked.push({ start: w.start, end: w.start + len });\n    used += len;\n  }\n  return picked.sort((a, b) => a.start - b.start).map(w => text.slice(w.start, w.end)).join(' … ');\n}\n\n// Regex fallback, run over the whole page text (cheap) - used when no LLM is\n// configured and to pre-fill fields the LLM leaves empty.\nfunction heuristics(text, html) {\n  const h = {};\n  const incomes = [...text.matchAll(/minimum[^.]{0,30}?(?:monthly\\s+)?(?:income|salary|nmi)[^₹\\d]{0,40}?(?:rs\\.?|₹|inr)\\s*([\\d,]{4,9})/gi)]\n    .map(m => num(m[1])).filter(v => v >= 5000 && v <= 500000);\n  // some lender pages embed their eligibility calculator config, e.g. \"minIncome\":30000\n  const calc = html.match(/minIncome[\"']?\\s*:\\s*[\"']?(\\d{4,7})/);\n  if (calc) incomes.push(num(calc[1]));\n  if (incomes.length) h.min_monthly_income = Math.min(...incomes);\n\n  const cs = text.match(/(?:credit|cibil)\\s+score\\s+(?:of\\s+|over\\s+|above\\s+|at least\\s+|minimum\\s+)?([5-8]\\d{2})\\b/i);\n  if (cs) h.min_credit_score = num(cs[1]);\n\n  const age = text.match(/age\\s+(?:at least|between|of|from)?\\s*(\\d{2})\\s*(?:years)?\\s*(?:and|to|-)\\s*(?:less than|up to|upto|below)?\\s*(\\d{2})/i)\n           || text.match(/(\\d{2})\\s*(?:years)?\\s*(?:to|-|–)\\s*(\\d{2})\\s*years/i);\n  if (age && num(age[1]) >= 18 && num(age[2]) <= 80 && num(age[1]) < num(age[2])) {\n    h.min_age = num(age[1]); h.max_age = num(age[2]);\n  }\n  if (/(?:must be|should be|only)\\s+salaried|salaried (?:indian )?residents/i.test(text)) h.employment_types = ['salaried'];\n\n  const amt = text.match(/up to\\s*(?:rs\\.?|₹)\\s*([\\d.]+)\\s*(lakh|crore|l\\b)/i);\n  if (amt) h.max_loan_amount = num(amt[1]) * (/crore/i.test(amt[2]) ? 1e7 : 1e5);\n  Object.assign(h, parseRates(text));\n  return h;\n}\n\n// ---------------------------------------------------------------- main\nconst out = [];\npages.forEach((page, idx) => {\n  const t = targets[idx];\n  const html = page.json.html;\n  if (!html || page.json.error) {\n    out.push({ json: { ...t, ok: false, error: String(page.json.error?.message || page.json.error || 'empty response') } });\n    return;\n  }\n  if (t.kind === 'rate_table') {\n    out.push({ json: { ...t, ok: true, rates: parseRateTable(html) } });\n    return;\n  }\n  const text = htmlToText(html);\n  const snippet = eligibilitySnippet(text);\n  out.push({ json: { ...t, ok: snippet.length > 0, snippet, content_hash: hash(snippet), heuristic: heuristics(text, html) } });\n});\nreturn out;\n"
+      },
+      "id": "ab22e104-9501-5765-9bc1-6110a052335c",
+      "name": "Clean, parse & fingerprint",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT url, content_hash, extracted FROM crawl_cache;",
+        "options": {}
+      },
+      "id": "6b2c9485-0f71-5a08-a2c7-adfa7b5d9376",
+      "name": "Load crawl cache",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        960,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decide which lender pages actually need the LLM.\n// A page is sent only if (a) its snippet hash changed since the last crawl and\n// (b) an LLM key is configured. Otherwise we reuse the cached extraction or\n// fall back to the regex heuristics. Always emits >= 1 item so the IF node\n// downstream runs (n8n stops a branch that receives zero items).\n\nconst pages = $('Clean, parse & fingerprint').all().map(i => i.json);\nconst cache = new Map($input.all().filter(i => i.json.url).map(i => [i.json.url, i.json]));\nconst llmEnabled = Boolean($env.LLM_API_KEY);\n\nconst SYSTEM = `You extract personal-loan eligibility criteria from Indian bank web page text.\nReturn ONLY a JSON object with these keys (use null when the text does not state it):\n{\"product_name\": string, \"interest_rate_min\": number, \"interest_rate_max\": number,\n \"min_monthly_income\": number (INR per month), \"min_credit_score\": number,\n \"min_age\": number, \"max_age\": number,\n \"employment_types\": array of \"salaried\" | \"self_employed\" | \"business\" (null if not restricted),\n \"max_loan_amount\": number (INR), \"other_criteria\": string (<= 200 chars, qualitative rules\n such as work experience or employer type)}.\nIf different minimum incomes are given for different cities or employment types, use the LOWEST.`;\n\nconst work = pages\n  .filter(p => p.kind === 'lender_page' && p.ok)\n  .filter(p => cache.get(p.url)?.content_hash !== p.content_hash)\n  .filter(() => llmEnabled)\n  .map(p => ({\n    json: {\n      url: p.url,\n      llm_request: {\n        model: $env.LLM_MODEL || 'gemini-3.5-flash-lite',\n        temperature: 0,\n        messages: [\n          { role: 'system', content: SYSTEM },\n          { role: 'user', content: `Lender: ${p.lender}\\nPage text:\\n${p.snippet}` },\n        ],\n      },\n    },\n  }));\n\nreturn work.length ? work : [{ json: { skip: true, reason: llmEnabled ? 'all pages unchanged' : 'LLM disabled' } }];\n"
+      },
+      "id": "526d5e27-8e64-5c0c-adeb-7760f6c76df6",
+      "name": "Plan LLM extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "39074b3d-8ad4-53c0-8767-1700c5abbb26",
+              "leftValue": "={{ $json.skip === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1a6c5a53-699c-5760-8c28-91e4b5c62c7f",
+      "name": "Any page changed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1440,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_BASE_URL }}/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.LLM_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 60000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 4000
+            }
+          }
+        }
+      },
+      "id": "313ea76c-3b9b-5c6f-b7f4-db2d9b8889e6",
+      "name": "LLM: extract criteria",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the LLM's JSON answers (one per lender page). Items line up 1:1 with\n// the \"Plan LLM extraction\" items. Bad / failed responses become null and the\n// finaliser falls back to cache or heuristics for that page.\nconst requests = $('Plan LLM extraction').all().map(i => i.json);\n\nfunction firstJsonObject(text) {\n  const m = String(text || '').match(/\\{[\\s\\S]*\\}/);\n  if (!m) return null;\n  try { return JSON.parse(m[0]); } catch { return null; }\n}\n\nreturn $input.all().map((item, idx) => {\n  const content = item.json.choices?.[0]?.message?.content;\n  const extracted = firstJsonObject(content);\n  return { json: { url: requests[idx].url, extracted, error: extracted ? null : (item.json.error?.message || 'unparseable LLM response') } };\n});\n"
+      },
+      "id": "cec7cac4-a506-5ea0-b351-bb6b8c6246cc",
+      "name": "Parse LLM output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge every source into one row per lender and hand a single JSON payload to\n// Postgres (one bulk upsert instead of one query per product).\n//\n// Field precedence per lender:  official site > aggregator page\n//                    per page:  fresh LLM > cached extraction > regex heuristic\n// Anything still missing gets conservative industry defaults, flagged as\n// criteria_source = 'default' so the matcher can down-weight it.\n\nconst pages = $('Clean, parse & fingerprint').all().map(i => i.json);\nconst cache = new Map($('Load crawl cache').all().filter(i => i.json.url).map(i => [i.json.url, i.json]));\nlet fresh = new Map();\ntry {\n  fresh = new Map($('Parse LLM output').all().filter(i => i.json.extracted).map(i => [i.json.url, i.json.extracted]));\n} catch (e) { /* LLM branch did not run this time */ }\n\nconst DEFAULTS = { min_monthly_income: 25000, min_credit_score: 750, min_age: 21, max_age: 60 };\nconst FIELDS = ['interest_rate_min', 'interest_rate_max', 'min_monthly_income', 'min_credit_score', 'min_age',\n  'max_age', 'employment_types', 'max_loan_amount', 'other_criteria', 'product_name'];\nconst EMP = new Set(['salaried', 'self_employed', 'business']);\n\nconst slug = s => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');\nconst canonicalLender = name => name.replace(/\\s+(personal loan|ltd\\.?|limited)$/i, '').trim();\nconst isNum = v => typeof v === 'number' && Number.isFinite(v);\n\nfunction clean(e = {}) {\n  const out = {};\n  for (const f of FIELDS) {\n    const v = e[f];\n    if (v === null || v === undefined || v === '') continue;\n    if (f === 'employment_types') {\n      const list = (Array.isArray(v) ? v : []).map(x => String(x).toLowerCase().replace(/[- ]/g, '_')).filter(x => EMP.has(x));\n      if (list.length) out[f] = [...new Set(list)];\n    } else if (f === 'other_criteria' || f === 'product_name') {\n      out[f] = String(v).slice(0, 300);\n    } else if (isNum(Number(v))) {\n      out[f] = Number(v);\n    }\n  }\n  // sanity bounds - an LLM or regex misread must not produce absurd criteria\n  const outside = (f, lo, hi) => out[f] !== undefined && (out[f] < lo || out[f] > hi);\n  if (outside('min_credit_score', 300, 900)) delete out.min_credit_score;\n  if (outside('min_monthly_income', 1000, 1000000)) delete out.min_monthly_income;\n  if (outside('interest_rate_min', 5, 45)) delete out.interest_rate_min;\n  if (outside('interest_rate_max', 5, 45) || out.interest_rate_max < out.interest_rate_min) delete out.interest_rate_max;\n  if (outside('min_age', 18, 70) || outside('max_age', 21, 80)) { delete out.min_age; delete out.max_age; }\n  return out;\n}\n\n// --- 1. per-page extraction, choosing the best available source -------------\nconst lenders = new Map(); // lender -> { official: {...}, aggregator: {...}, urls, sources }\nconst cacheRows = [];\nfor (const p of pages.filter(p => p.kind === 'lender_page' && p.ok)) {\n  let extracted, via;\n  if (fresh.has(p.url)) { extracted = fresh.get(p.url); via = 'llm'; }\n  else if (cache.get(p.url)?.content_hash === p.content_hash && cache.get(p.url)?.extracted) {\n    extracted = cache.get(p.url).extracted; via = cache.get(p.url).extracted._via || 'llm';\n  } else { extracted = p.heuristic; via = 'heuristic'; }\n\n  const record = { ...clean(p.heuristic), ...clean(extracted) }; // LLM/cached values override regex\n  // Only cache LLM results: a heuristic-only page must be retried once an LLM key is available.\n  if (via === 'llm') cacheRows.push({ url: p.url, content_hash: p.content_hash, extracted: { ...record, _via: via } });\n\n  const key = canonicalLender(p.lender);\n  const entry = lenders.get(key) || { lender: key, official: null, aggregator: null, url: p.url, via: new Set() };\n  entry[p.source === 'official' ? 'official' : 'aggregator'] = record;\n  if (p.source === 'official') entry.url = p.url;\n  entry.via.add(via);\n  lenders.set(key, entry);\n}\n\n// --- 2. add rate-table lenders (rates + fees for many lenders in one page) ---\nconst rateRows = pages.find(p => p.kind === 'rate_table' && p.ok)?.rates || [];\nconst rateUrl = pages.find(p => p.kind === 'rate_table')?.url;\nfor (const r of rateRows) {\n  const key = canonicalLender(r.lender);\n  const entry = lenders.get(key) || { lender: key, official: null, aggregator: null, url: rateUrl, via: new Set(['default']) };\n  entry.table = r;\n  lenders.set(key, entry);\n}\n\n// --- 3. merge into product rows ---------------------------------------------\nconst products = [];\nfor (const e of lenders.values()) {\n  const merged = { ...(e.table ? clean(e.table) : {}), ...(e.aggregator || {}), ...(e.official || {}) };\n  const usedDefaults = Object.keys(DEFAULTS).filter(k => merged[k] === undefined);\n  for (const k of usedDefaults) merged[k] = DEFAULTS[k];\n  const criteriaSource = usedDefaults.length === Object.keys(DEFAULTS).length ? 'default'\n    : e.via.has('llm') ? 'llm' : 'heuristic';\n  products.push({\n    product_key: `${slug(e.lender)}-personal-loan`,\n    lender: e.lender,\n    product_name: merged.product_name || `${e.lender} Personal Loan`,\n    interest_rate_min: merged.interest_rate_min ?? null,\n    interest_rate_max: merged.interest_rate_max ?? null,\n    processing_fee: e.table?.processing_fee ?? null,\n    min_monthly_income: merged.min_monthly_income,\n    min_credit_score: merged.min_credit_score,\n    max_credit_score: null,\n    min_age: merged.min_age,\n    max_age: merged.max_age,\n    employment_types: merged.employment_types ?? null,\n    max_loan_amount: merged.max_loan_amount ?? null,\n    other_criteria: merged.other_criteria ?? null,\n    source_url: e.url,\n    criteria_source: criteriaSource,\n  });\n}\n\nconst summary = {\n  pages_ok: pages.filter(p => p.ok).length,\n  pages_failed: pages.filter(p => !p.ok).map(p => p.url),\n  llm_extractions: fresh.size,\n  products: products.length,\n  by_criteria_source: products.reduce((a, p) => ({ ...a, [p.criteria_source]: (a[p.criteria_source] || 0) + 1 }), {}),\n};\nif (!products.length) throw new Error(`Crawl produced no products: ${JSON.stringify(summary)}`);\n\nreturn [{ json: { products_json: JSON.stringify(products), cache_json: JSON.stringify(cacheRows), summary } }];\n"
+      },
+      "id": "b673fc6b-debf-5049-aa27-8bc97ad3d155",
+      "name": "Merge sources → products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One round-trip: upsert all products, refresh the crawl cache, and retire\n-- products that have not been seen for 7 days (delisted by the lender).\nWITH incoming AS (\n    SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(\n        product_key text, lender text, product_name text,\n        interest_rate_min numeric, interest_rate_max numeric, processing_fee text,\n        min_monthly_income numeric, min_credit_score int, max_credit_score int,\n        min_age int, max_age int, employment_types text[], max_loan_amount numeric,\n        other_criteria text, source_url text, criteria_source text)\n),\nupserted AS (\n    INSERT INTO loan_products (product_key, lender, product_name, interest_rate_min, interest_rate_max,\n                               processing_fee, min_monthly_income, min_credit_score, max_credit_score,\n                               min_age, max_age, employment_types, max_loan_amount, other_criteria,\n                               source_url, criteria_source)\n    SELECT product_key, lender, product_name, interest_rate_min, interest_rate_max,\n           processing_fee, min_monthly_income, min_credit_score, max_credit_score,\n           min_age, max_age, employment_types, max_loan_amount, other_criteria,\n           source_url, criteria_source\n    FROM incoming\n    ON CONFLICT (product_key) DO UPDATE SET\n        lender = EXCLUDED.lender, product_name = EXCLUDED.product_name,\n        interest_rate_min = EXCLUDED.interest_rate_min, interest_rate_max = EXCLUDED.interest_rate_max,\n        processing_fee = EXCLUDED.processing_fee, min_monthly_income = EXCLUDED.min_monthly_income,\n        min_credit_score = EXCLUDED.min_credit_score, max_credit_score = EXCLUDED.max_credit_score,\n        min_age = EXCLUDED.min_age, max_age = EXCLUDED.max_age, employment_types = EXCLUDED.employment_types,\n        max_loan_amount = EXCLUDED.max_loan_amount, other_criteria = EXCLUDED.other_criteria,\n        source_url = EXCLUDED.source_url, criteria_source = EXCLUDED.criteria_source,\n        is_active = TRUE, last_seen_at = now(), updated_at = now()\n    RETURNING (xmax = 0) AS inserted\n),\ncached AS (\n    INSERT INTO crawl_cache (url, content_hash, extracted)\n    SELECT url, content_hash, extracted FROM jsonb_to_recordset($2::jsonb) AS c(url text, content_hash text, extracted jsonb)\n    ON CONFLICT (url) DO UPDATE SET content_hash = EXCLUDED.content_hash, extracted = EXCLUDED.extracted, fetched_at = now()\n    RETURNING 1\n),\nretired AS (\n    UPDATE loan_products SET is_active = FALSE, updated_at = now()\n    WHERE is_active AND last_seen_at < now() - interval '7 days'\n    RETURNING 1\n)\nSELECT (SELECT count(*) FROM upserted WHERE inserted)     AS products_inserted,\n       (SELECT count(*) FROM upserted WHERE NOT inserted) AS products_updated,\n       (SELECT count(*) FROM cached)                      AS cache_rows_written,\n       (SELECT count(*) FROM retired)                     AS products_retired;\n",
+        "options": {
+          "queryReplacement": "={{ $json.products_json }},{{ $json.cache_json }}"
+        }
+      },
+      "id": "4e76f449-0266-58d8-8060-a6f815ea1acc",
+      "name": "Upsert loan_products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2400,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "LoanEnginePgDb01",
+          "name": "Loan Engine Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 03:00 IST": {
+      "main": [
+        [
+          {
+            "node": "Crawl targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Crawl targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run via dashboard (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Crawl targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crawl targets": {
+      "main": [
+        [
+          {
+            "node": "Fetch page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch page": {
+      "main": [
+        [
+          {
+            "node": "Clean, parse & fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean, parse & fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Load crawl cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load crawl cache": {
+      "main": [
+        [
+          {
+            "node": "Plan LLM extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan LLM extraction": {
+      "main": [
+        [
+          {
+            "node": "Any page changed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any page changed?": {
+      "main": [
+        [
+          {
+            "node": "LLM: extract criteria",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge sources → products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM: extract criteria": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM output": {
+      "main": [
+        [
+          {
+            "node": "Merge sources → products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge sources → products": {
+      "main": [
+        [
+          {
+            "node": "Upsert loan_products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "saveManualExecutions": true
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
