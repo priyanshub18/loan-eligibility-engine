@@ -1,0 +1,14 @@
+{
+  "name": "loan-eligibility-engine",
+  "private": true,
+  "description": "Serverless Framework tooling for the Loan Eligibility Engine AWS stack",
+  "scripts": {
+    "deploy": "serverless deploy",
+    "migrate": "serverless invoke -f migrate",
+    "remove": "serverless remove"
+  },
+  "devDependencies": {
+    "serverless": "^3.39.0",
+    "serverless-python-requirements": "^6.1.1"
+  }
+}

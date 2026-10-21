@@ -1,0 +1,236 @@
+# =============================================================================
+# Loan Eligibility Engine - AWS stack
+#
+#   Browser --POST /uploads--> API GW --> uploadUrl λ --> presigned S3 POST
+#   Browser --multipart POST (direct)--> S3 uploads/<batch>.csv
+#   S3 ObjectCreated --> SQS (DLQ after 3 tries) --> ingestCsv λ --> RDS Postgres
+#   ingestCsv λ --HTTPS + X-Webhook-Token--> n8n Workflow B (matching)
+#
+# Deploy:  npx serverless deploy --stage dev
+# =============================================================================
+service: loan-eligibility-engine
+frameworkVersion: "3"
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  stage: ${sls:stage}
+  bucketName: ${self:service}-${sls:stage}-uploads-${aws:accountId}
+  # Restrict to your n8n host / office IP in anything beyond a demo.
+  dbAllowedCidr: ${env:DB_ALLOWED_CIDR, '0.0.0.0/0'}
+  n8nMatchWebhookUrl: ${env:N8N_MATCH_WEBHOOK_URL, ''}
+  webhookTokenParam: /loan-engine/${sls:stage}/n8n-webhook-token
+  apiKeyParam: /loan-engine/${sls:stage}/n8n-api-key
+  pythonRequirements:
+    dockerizePip: false   # pg8000 + deps are pure Python; no native build needed
+    pythonBin: ${env:PYTHON_BIN, 'python3'}   # any local python3 works: deps are pure Python
+    slim: false           # slim strips *.dist-info, which scramp (pg8000 dep) reads at import time
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: arm64        # Graviton: ~20% cheaper per GB-s
+  region: ${opt:region, 'ap-south-1'}
+  memorySize: 256
+  timeout: 10
+  logRetentionInDays: 14
+  environment:
+    DB_HOST: !GetAtt LoanDb.Endpoint.Address
+    DB_PORT: !GetAtt LoanDb.Endpoint.Port
+    DB_NAME: loanengine
+    DB_USER: loanadmin
+    DB_SECRET_ARN: !GetAtt LoanDb.MasterUserSecret.SecretArn
+    DB_SSL: require
+    UPLOAD_BUCKET: ${self:custom.bucketName}
+    N8N_MATCH_WEBHOOK_URL: ${self:custom.n8nMatchWebhookUrl}
+    N8N_WEBHOOK_TOKEN_PARAM: ${self:custom.webhookTokenParam}
+    N8N_API_KEY_PARAM: ${self:custom.apiKeyParam}
+    N8N_UI_URL: ${env:N8N_UI_URL, 'http://localhost:5678'}
+  httpApi:
+    cors:
+      allowedOrigins: ["*"]
+      allowedHeaders: [Content-Type]
+      allowedMethods: [GET, POST, OPTIONS]
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action: [s3:PutObject, s3:GetObject]
+          Resource: arn:aws:s3:::${self:custom.bucketName}/uploads/*
+        - Effect: Allow
+          Action: secretsmanager:GetSecretValue
+          Resource: !GetAtt LoanDb.MasterUserSecret.SecretArn
+        - Effect: Allow
+          Action: ssm:GetParameter
+          Resource:
+            - arn:aws:ssm:${aws:region}:${aws:accountId}:parameter${self:custom.webhookTokenParam}
+            - arn:aws:ssm:${aws:region}:${aws:accountId}:parameter${self:custom.apiKeyParam}
+
+package:
+  patterns:          # ship src/, db/schema.sql and certs/; drop tooling
+    - "!node_modules/**"
+    - "!tests/**"
+    - "!.pytest_cache/**"
+    - "!db/seed_loan_products.sql"
+    - "!package*.json"
+    - "!requirements-dev.txt"
+
+functions:
+  uploadUrl:
+    handler: src/handlers/upload_url.handler
+    description: Issues a presigned S3 POST + creates the upload batch row
+    events:
+      - httpApi:
+          path: /uploads
+          method: post
+
+  uploadStatus:
+    handler: src/handlers/status.handler
+    description: Returns batch status + matching funnel stats for the UI
+    events:
+      - httpApi:
+          path: /uploads/{batchId}
+          method: get
+
+  ingestCsv:
+    handler: src/handlers/ingest.handler
+    description: Streams the CSV from S3, validates, COPYs into RDS, triggers n8n
+    memorySize: 512
+    timeout: 900
+    events:
+      - sqs:
+          arn: !GetAtt UploadQueue.Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+          maximumConcurrency: 5   # protect RDS from connection storms; unlike reservedConcurrency it works on new accounts (10-concurrency quota)
+
+  dashboard:
+    handler: src/handlers/dashboard.handler
+    description: Read-only dashboard API (batches, matches, products, DB health, n8n executions)
+    memorySize: 512          # parses n8n execution payloads (Workflow B's is ~8 MB)
+    timeout: 29              # API Gateway's integration limit is 30 s
+    events:
+      - httpApi:
+          path: /api/{proxy+}
+          method: get
+      - httpApi:
+          path: /api/{proxy+}
+          method: post
+
+  migrate:
+    handler: src/handlers/migrate.handler
+    description: Applies db/schema.sql (idempotent)
+    timeout: 60
+
+resources:
+  Resources:
+    # ---------------------------------------------------------------- storage
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: UploadQueuePolicy
+      Properties:
+        BucketName: ${self:custom.bucketName}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+        LifecycleConfiguration:
+          Rules:
+            - Id: expire-raw-uploads
+              Status: Enabled
+              Prefix: uploads/
+              ExpirationInDays: 7   # raw PII files are not kept once ingested
+        CorsConfiguration:
+          CorsRules:
+            - AllowedMethods: [POST]
+              AllowedOrigins: ["*"]
+              AllowedHeaders: ["*"]
+              MaxAge: 3000
+        NotificationConfiguration:
+          QueueConfigurations:
+            - Event: s3:ObjectCreated:*
+              Queue: !GetAtt UploadQueue.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - { Name: prefix, Value: uploads/ }
+                    - { Name: suffix, Value: .csv }
+
+    # ---------------------------------------------------------------- queueing
+    UploadDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-uploads-dlq
+        MessageRetentionPeriod: 1209600
+
+    UploadQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-uploads
+        VisibilityTimeout: 5400   # 6x the ingest Lambda timeout (AWS guidance)
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt UploadDLQ.Arn
+          maxReceiveCount: 3
+
+    UploadQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [!Ref UploadQueue]
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: { Service: s3.amazonaws.com }
+              Action: sqs:SendMessage
+              Resource: !GetAtt UploadQueue.Arn
+              Condition:
+                ArnLike:
+                  aws:SourceArn: arn:aws:s3:::${self:custom.bucketName}
+                StringEquals:
+                  aws:SourceAccount: !Ref AWS::AccountId
+
+    # ---------------------------------------------------------------- database
+    DbSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Postgres access for Lambda + self-hosted n8n
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: ${self:custom.dbAllowedCidr}
+
+    LoanDb:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete         # demo stack: no final snapshot on `serverless remove`
+      UpdateReplacePolicy: Delete
+      Properties:
+        DBInstanceIdentifier: ${self:service}-${sls:stage}
+        Engine: postgres
+        EngineVersion: "16"
+        DBInstanceClass: db.t4g.micro      # free-tier eligible
+        AllocatedStorage: "20"
+        StorageType: gp3
+        StorageEncrypted: true
+        DBName: loanengine
+        MasterUsername: loanadmin
+        ManageMasterUserPassword: true     # password generated + rotated in Secrets Manager
+        PubliclyAccessible: true           # see README "Security trade-offs"
+        VPCSecurityGroups: [!GetAtt DbSecurityGroup.GroupId]
+        BackupRetentionPeriod: 0         # no automated backups (demo data is re-uploadable); also skips the initial backup
+        DeletionProtection: false
+
+  Outputs:
+    UploadBucketName:
+      Value: ${self:custom.bucketName}
+    DbEndpoint:
+      Value: !GetAtt LoanDb.Endpoint.Address
+    DbSecretArn:
+      Value: !GetAtt LoanDb.MasterUserSecret.SecretArn
+    UploadDLQUrl:
+      Value: !Ref UploadDLQ

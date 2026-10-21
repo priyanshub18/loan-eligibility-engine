@@ -1,0 +1,2 @@
+# boto3 is provided by the Lambda runtime; install it locally via requirements-dev.txt
+pg8000==1.31.2
